@@ -1,0 +1,582 @@
+// KernRift type checker — slots into analysis.kr's diag pipeline.
+//
+// Phase 1 rules (errors, default-on; zero violations on the self-host):
+//   A3  unknown-field              — `x.f` where x is struct S but S has no f
+//   A4  struct-field-of-non-struct — `x.f` where x isn't a struct
+//   A6  return-type-mismatch       — bare `return` in non-void fn, or
+//                                    `return expr` in void fn
+//   B5  binop-on-struct            — arithmetic / bitwise on a struct operand
+//   B7  bool-required-in-condition — `if`/`while` with struct or float cond
+//
+// Phase 2 rules (also errors — zero violations on the self-host):
+//   A5  void-fn-used-as-value      — using the result of a void-returning call
+//   B1  assign-struct-vs-non-struct — assigning struct to non-struct slot or
+//                                    vice versa
+//   B2  assign-struct-kind         — assigning struct A to a struct B variable
+//   B6  compare-on-struct          — `==`/`!=`/`<` etc. with a struct operand
+//
+// TypeKind tags reuse the lexer's type-keyword token kinds where possible:
+//   0     = unknown / unresolved
+//   1     = void
+//   80-87 = uint8/16/32/64, int8/16/32/64
+//   94-96 = f16, f32, f64
+//   98    = bool
+//   99    = char
+//   200+i = StructRef where i = struct_idx
+//   0xFFFFFFFF = poisoned (suppresses cascading diagnostics)
+
+// --- AST kind constants (see src/ast.kr) ---
+//   2  FnDecl    3  Param    10 VarDecl   11 Assign   12 Return
+//   13 If        14 While    15 Block     16 ExprStmt
+//   30 IntLit    31 StrLit   32 Ident
+//   33 BinOp     34 UnaryOp  35 Call      36 FieldAccess
+//   37 Index     38 Compare  39 LogicalAnd 40 LogicalOr
+//   46 FloatLit  48 StructLit 49 SizeofLit
+
+// Per-function local var table.
+// Layout: [name_tok(4), typekind(4)] x cap.
+static uint64 tc_local_table = 0
+static uint64 tc_local_count = 0
+static uint64 tc_local_cap = 0
+// Current function's declared return TypeKind (0 = void).
+static uint64 tc_current_ret_kind = 0
+static uint64 tc_current_fn_tok = 0
+
+@export
+fn tc_init() {
+    if tc_local_table == 0 {
+        tc_local_cap = 4096
+        tc_local_table = alloc(tc_local_cap * 8)
+    }
+    tc_local_count = 0
+}
+
+fn tc_local_register(uint64 name_tok, uint64 typekind) {
+    if tc_local_count >= tc_local_cap { return }
+    uint64 entry = tc_local_table + tc_local_count * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 tk = typekind
+    unsafe { *(e4 as uint32) = tk }
+    tc_local_count = tc_local_count + 1
+}
+
+fn tc_local_lookup(uint64 name_tok) -> uint64 {
+    // Walk in REVERSE so inner scopes shadow outer ones if names collide.
+    uint64 i = tc_local_count
+    while i > 0 {
+        i = i - 1
+        uint64 entry = tc_local_table + i * 8
+        uint32 nt = 0
+        unsafe { *(entry as uint32) -> nt }
+        uint64 wnt = nt
+        if tok_text_eq(wnt, name_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 tk = 0
+            unsafe { *(e4 as uint32) -> tk }
+            return tk
+        }
+    }
+    return 0
+}
+
+// Map a type-keyword token (or struct-name token) to a TypeKind.
+// The parser stashes type tokens in VarDecl.data1 / Param.data1 / FnDecl.data2.
+fn tc_kind_of_type_tok(uint64 type_tok) -> uint64 {
+    if type_tok == 0 { return 1 }   // void
+    uint64 k = tok_kind_at_raw(type_tok)
+    // Builtin numeric / bool / char keywords land in 80..99 ranges.
+    if k >= 80 && k <= 87 { return k }
+    if k >= 94 && k <= 96 { return k }
+    if k == 98 || k == 99 { return k }
+    // Struct name (Ident token kind == 1).
+    if k == 1 {
+        uint64 si = struct_lookup(type_tok)
+        if si != 0xFFFFFFFF { return 200 + si }
+    }
+    return 0  // unknown / pointer-typed alias / etc.
+}
+
+fn tc_is_struct_kind(uint64 tk) -> uint64 {
+    if tk >= 200 && tk < 0xFFFF { return 1 }
+    return 0
+}
+
+fn tc_is_float_kind(uint64 tk) -> uint64 {
+    if tk >= 94 && tk <= 96 { return 1 }
+    return 0
+}
+
+// 1 iff `node` is a Call expression whose callee is known and returns void.
+// 0 otherwise (including: not a call, or callee unknown / extern / builtin).
+fn tc_call_returns_void(uint64 node) -> uint64 {
+    if node == 0 { return 0 }
+    uint32 kind = ast_kind(node)
+    if kind != 35 { return 0 }
+    uint32 callee = ast_data1(node)
+    uint64 wcallee = callee
+    uint64 r = fn_sig_returns(wcallee)
+    if r == 0 { return 1 }
+    return 0
+}
+
+// Derive the TypeKind of an expression node. Returns 0 on unknown,
+// 0xFFFFFFFF on poisoned (suppresses follow-on diagnostics).
+fn tc_expr_kind(uint64 node) -> uint64 {
+    if node == 0 { return 0 }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+    // IntLit (30): char/bool tagged via data4; else uint64.
+    if wkind == 30 {
+        uint32 d4 = ast_data4(node)
+        uint64 wd4 = d4
+        if wd4 == 98 { return 98 }    // bool
+        if wd4 == 99 { return 99 }    // char
+        return 83                       // uint64 default
+    }
+    // FloatLit (46)
+    if wkind == 46 { return 96 }
+    // StrLit (31): char* / uint64
+    if wkind == 31 { return 83 }
+    // Ident (32) — canonical name token is in data1.
+    if wkind == 32 {
+        uint32 nt = ast_data1(node)
+        return tc_local_lookup(nt)
+    }
+    // Compare (38), LogicalAnd/Or (39, 40)
+    if wkind == 38 { return 98 }
+    if wkind == 39 { return 98 }
+    if wkind == 40 { return 98 }
+    // BinOp (33) — type of left operand (after typecheck).
+    if wkind == 33 {
+        uint32 lhs = ast_child(node)
+        return tc_expr_kind(lhs)
+    }
+    // Call (35) — fn return type via fn_sig_table won't tell us the kind
+    // directly (fn_sig only knows has_return:0/1), so consult the
+    // codegen-side return-kind tables.
+    if wkind == 35 {
+        uint32 callee = ast_data1(node)
+        uint64 wcallee = callee
+        // Float return?
+        uint64 fret = fn_ret_float_lookup(wcallee)
+        if fret == 1 { return 96 }
+        if fret == 2 { return 95 }
+        // Struct return?
+        uint64 sret = fn_ret_struct_lookup(wcallee)
+        if sret != 0xFFFFFFFF { return 200 + sret }
+        return 83  // assume uint64 / pointer / default
+    }
+    // FieldAccess (36): receiver in child, field-name token in data2.
+    if wkind == 36 {
+        uint32 recv = ast_child(node)
+        uint64 rk = tc_expr_kind(recv)
+        if tc_is_struct_kind(rk) == 0 { return 0xFFFFFFFF }
+        uint64 si = rk - 200
+        uint32 ft = ast_data2(node)
+        uint64 wft = ft
+        uint64 ftk = struct_field_type_kind_by_tok(si, wft)
+        // struct_field_type_kind_by_tok returns 0 on field miss.
+        if ftk == 0 { return 0xFFFFFFFF }
+        if ftk >= 256 { return 200 + (ftk - 256) }
+        return ftk
+    }
+    // (PtrLoad has no AstKind enum entry — IR emits it directly from
+    // unsafe-block syntax, not as a tagged AST node.)
+    // SizeofLit (49) → uint64
+    if wkind == 49 { return 83 }
+    // Index (37) → element type unknown without array-element tracking;
+    // assume uint64 for now.
+    if wkind == 37 { return 83 }
+    // StructLit (48) → StructRef
+    if wkind == 48 {
+        uint32 type_tok = ast_data1(node)
+        return tc_kind_of_type_tok(type_tok)
+    }
+    return 0
+}
+
+// ---- Walkers ----
+
+fn tc_check_expr(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+
+    // Per-kind explicit walking. Following ast_next blindly walks into
+    // stale pointers from prior list memberships.
+
+    // Call (35): walk args via child→next (this IS a list).
+    if wkind == 35 {
+        uint32 arg = ast_child(node)
+        uint64 warg = arg
+        while warg != 0 {
+            tc_check_expr(warg)
+            uint32 anxt = ast_next(warg)
+            warg = anxt
+        }
+        return
+    }
+
+    // BinOp (33), Compare (38): child=lhs, data2=rhs.
+    if wkind == 33 || wkind == 38 {
+        uint32 lhs = ast_child(node)
+        if lhs != 0 { tc_check_expr(lhs) }
+        uint32 rhs = ast_data2(node)
+        if rhs != 0 { tc_check_expr(rhs) }
+        uint64 lk = tc_expr_kind(lhs)
+        uint64 rk = tc_expr_kind(rhs)
+        // ---- B5: binop-on-struct ----
+        if wkind == 33 {
+            if tc_is_struct_kind(lk) != 0 || tc_is_struct_kind(rk) != 0 {
+                uint32 ot = ast_tok(node)
+                diag_emit_str(ot, 0, "arithmetic operator on struct value")
+            }
+        }
+        // ---- B6: compare-on-struct (Phase 2, warning) ----
+        if wkind == 38 {
+            if tc_is_struct_kind(lk) != 0 || tc_is_struct_kind(rk) != 0 {
+                uint32 ot = ast_tok(node)
+                diag_emit_str(ot, 0, "comparison with struct value (use field-by-field comparison)")
+            }
+        }
+        // ---- A5: void-fn-used-as-value (Phase 2, warning) ----
+        if tc_call_returns_void(lhs) != 0 || tc_call_returns_void(rhs) != 0 {
+            uint32 ot = ast_tok(node)
+            diag_emit_str(ot, 0, "result of void-returning function used as a value")
+        }
+        return
+    }
+
+    // LogicalAnd (39), LogicalOr (40): child=lhs, data2=rhs.
+    // (ast.kr's comment "data1=rhs_idx" is stale — the parser writes
+    // the operator token to data1 and the RHS index to data2, same as
+    // BinOp/Compare.)
+    if wkind == 39 || wkind == 40 {
+        uint32 lhs = ast_child(node)
+        if lhs != 0 { tc_check_expr(lhs) }
+        uint32 rhs = ast_data2(node)
+        if rhs != 0 { tc_check_expr(rhs) }
+        return
+    }
+
+    // UnaryOp (34): child=operand.
+    if wkind == 34 {
+        uint32 op = ast_child(node)
+        if op != 0 { tc_check_expr(op) }
+        return
+    }
+
+    // FieldAccess (36): child=recv, data2=field-name token (NOT an expr).
+    if wkind == 36 {
+        uint32 recv = ast_child(node)
+        if recv != 0 { tc_check_expr(recv) }
+        uint64 rk = tc_expr_kind(recv)
+        // ---- A4: struct-field-of-non-struct ----
+        if rk != 0 && rk != 0xFFFFFFFF && tc_is_struct_kind(rk) == 0 {
+            uint32 ft = ast_tok(node)
+            diag_emit_str(ft, 0, "field access on non-struct value")
+        }
+        // ---- A3: unknown-field ----
+        if tc_is_struct_kind(rk) != 0 {
+            uint64 si = rk - 200
+            uint32 fname = ast_data2(node)
+            uint64 wfn = fname
+            uint64 fo = struct_field_offset(si, wfn)
+            if fo == 0xFFFFFFFF {
+                diag_emit_str(wfn, 0, "no such field on this struct type")
+            }
+        }
+        return
+    }
+
+    // Index (37): child=array_expr, data1=index_expr.
+    if wkind == 37 {
+        uint32 arr = ast_child(node)
+        if arr != 0 { tc_check_expr(arr) }
+        uint32 idx = ast_data1(node)
+        if idx != 0 { tc_check_expr(idx) }
+        return
+    }
+
+    // FString (50): child=first segment, segments are linked via next.
+    if wkind == 50 {
+        uint32 seg = ast_child(node)
+        uint64 wseg = seg
+        while wseg != 0 {
+            tc_check_expr(wseg)
+            uint32 snxt = ast_next(wseg)
+            wseg = snxt
+        }
+        return
+    }
+
+    // Leaf nodes / nodes without sub-expressions (IntLit, StrLit, Ident,
+    // FloatLit, SizeofLit, StructLit, etc.) — nothing to recurse into.
+}
+
+fn tc_check_stmt(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+
+    // Block (15) — recurse into children as statements.
+    if wkind == 15 {
+        uint32 c = ast_child(node)
+        uint64 wc = c
+        while wc != 0 {
+            tc_check_stmt(wc)
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+        return
+    }
+
+    // VarDecl (10): register the var with its type, then check init.
+    if wkind == 10 {
+        uint32 type_tok = ast_data1(node)
+        uint32 name_tok = ast_data2(node)
+        uint32 d4 = ast_data4(node)
+        uint64 tk
+        if d4 != 0 {
+            tk = 200 + (d4 - 1)
+        } else {
+            tk = tc_kind_of_type_tok(type_tok)
+        }
+        tc_local_register(name_tok, tk)
+        uint32 init = ast_child(node)
+        uint64 winit = init
+        if winit != 0 {
+            tc_check_expr(winit)
+            // ---- A5 ----
+            if tc_call_returns_void(winit) != 0 {
+                uint32 it = ast_tok(node)
+                diag_emit_str(it, 0, "void-returning function used to initialize a variable")
+            }
+            // ---- B1 / B2 ----
+            uint64 ik = tc_expr_kind(winit)
+            if ik != 0 && ik != 0xFFFFFFFF {
+                uint64 lhs_struct = tc_is_struct_kind(tk)
+                uint64 rhs_struct = tc_is_struct_kind(ik)
+                if lhs_struct != rhs_struct {
+                    uint32 it = ast_tok(node)
+                    diag_emit_str(it, 0, "initializer struct/non-struct mismatch")
+                } else if lhs_struct != 0 && rhs_struct != 0 && tk != ik {
+                    uint32 it = ast_tok(node)
+                    diag_emit_str(it, 0, "initializer struct kind does not match declared type")
+                }
+            }
+        }
+        return
+    }
+
+    // Assign (11): data1=name_tok, child=value_expr.
+    if wkind == 11 {
+        uint32 c = ast_child(node)
+        uint64 wc = c
+        if wc != 0 { tc_check_expr(wc) }
+        // ---- A5 ----
+        if tc_call_returns_void(c) != 0 {
+            uint32 atok = ast_tok(node)
+            diag_emit_str(atok, 0, "void-returning function assigned to a variable")
+        }
+        // ---- B1 / B2 ----
+        uint32 lhs_name = ast_data1(node)
+        uint64 wln = lhs_name
+        uint64 lk = tc_local_lookup(wln)
+        uint64 rk = tc_expr_kind(c)
+        if lk != 0 && rk != 0 && rk != 0xFFFFFFFF {
+            uint64 lhs_struct = tc_is_struct_kind(lk)
+            uint64 rhs_struct = tc_is_struct_kind(rk)
+            if lhs_struct != rhs_struct {
+                uint32 atok = ast_tok(node)
+                diag_emit_str(atok, 0, "assignment struct/non-struct mismatch")
+            } else if lhs_struct != 0 && rhs_struct != 0 && lk != rk {
+                uint32 atok = ast_tok(node)
+                diag_emit_str(atok, 0, "assignment struct kind does not match")
+            }
+        }
+        return
+    }
+
+    // Return (12): A6 + A5 + recurse.
+    if wkind == 12 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        if tc_current_ret_kind == 1 {
+            // void fn — return must be bare.
+            if wexpr != 0 {
+                uint32 rt = ast_tok(node)
+                diag_emit_str(rt, 0, "return with value in void function")
+                tc_check_expr(wexpr)
+            }
+        } else {
+            // non-void fn — return must carry a value.
+            if wexpr == 0 {
+                uint32 rt = ast_tok(node)
+                diag_emit_str(rt, 0, "return without value in non-void function")
+            } else {
+                tc_check_expr(wexpr)
+                // ---- A5 ----
+                if tc_call_returns_void(wexpr) != 0 {
+                    uint32 rt = ast_tok(node)
+                    diag_emit_str(rt, 0, "returning the result of a void-returning function")
+                }
+            }
+        }
+        return
+    }
+
+    // ExprStmt (16): walk the inner expr.
+    if wkind == 16 {
+        uint32 e = ast_child(node)
+        tc_check_expr(e)
+        return
+    }
+
+    // If (13): child=cond, data1=then-body, data2=else-body
+    if wkind == 13 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        if wcond != 0 {
+            uint64 ck = tc_expr_kind(wcond)
+            if tc_is_struct_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                diag_emit_str(tt, 0, "condition must be a scalar, got struct value")
+            }
+            if tc_is_float_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                diag_emit_str(tt, 0, "condition must be a scalar, got float value")
+            }
+            tc_check_expr(wcond)
+        }
+        uint32 thenb = ast_data1(node)
+        uint64 wt = thenb
+        if wt != 0 { tc_check_stmt(wt) }
+        uint32 elseb = ast_data2(node)
+        uint64 we = elseb
+        if we != 0 { tc_check_stmt(we) }
+        return
+    }
+
+    // While (14): child=cond, data1=body
+    if wkind == 14 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        if wcond != 0 {
+            uint64 ck = tc_expr_kind(wcond)
+            if tc_is_struct_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                diag_emit_str(tt, 0, "condition must be a scalar, got struct value")
+            }
+            if tc_is_float_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                diag_emit_str(tt, 0, "condition must be a scalar, got float value")
+            }
+            tc_check_expr(wcond)
+        }
+        uint32 body = ast_data1(node)
+        uint64 wb = body
+        if wb != 0 { tc_check_stmt(wb) }
+        return
+    }
+
+    // Default: walk children as statements.
+    uint32 c2 = ast_child(node)
+    uint64 wc2 = c2
+    while wc2 != 0 {
+        tc_check_stmt(wc2)
+        uint32 nxt = ast_next(wc2)
+        wc2 = nxt
+    }
+}
+
+fn tc_check_function(uint64 fn_node) {
+    tc_local_count = 0
+    uint32 fn_tok = ast_data1(fn_node)
+    uint32 ret_tok = ast_data2(fn_node)
+    tc_current_fn_tok = fn_tok
+    tc_current_ret_kind = tc_kind_of_type_tok(ret_tok)
+    if ret_tok == 0 { tc_current_ret_kind = 1 }    // void
+
+    // Register parameters as locals (child = first param in the chain).
+    uint32 param = ast_child(fn_node)
+    uint64 wp = param
+    while wp != 0 {
+        uint32 pkind = ast_kind(wp)
+        if pkind == 3 {
+            uint32 ptype_tok = ast_data1(wp)
+            uint32 pname_tok = ast_data2(wp)
+            uint64 ptk = tc_kind_of_type_tok(ptype_tok)
+            tc_local_register(pname_tok, ptk)
+        }
+        uint32 nxt = ast_next(wp)
+        wp = nxt
+    }
+
+    // Body lives in data3 (parser.kr line ~1639: ast_set_data3(node, body)).
+    uint32 b = ast_data3(fn_node)
+    uint64 body = b
+    if body != 0 { tc_check_stmt(body) }
+}
+
+// Pre-pass: walk FnDecls and seed fn_ret_struct_table / fn_ret_float_table
+// so tc_expr_kind can resolve Call return types. Codegen does this later
+// in its own walk; we need it here, before codegen runs.
+fn tc_collect_signatures(uint64 root) {
+    uint32 child = ast_child(root)
+    uint64 wc = child
+    while wc != 0 {
+        uint32 ck = ast_kind(wc)
+        if ck == 2 {
+            uint32 fname = ast_data1(wc)
+            uint32 ret_tok = ast_data2(wc)
+            uint64 wname = fname
+            uint64 wret = ret_tok
+            if wret != 0 {
+                uint64 rk = tok_kind_at_raw(wret)
+                if rk == 96 { fn_ret_float_register(wname, 1) }
+                if rk == 95 { fn_ret_float_register(wname, 2) }
+                // Struct name (Ident token): register return-struct.
+                if rk == 1 {
+                    uint64 si = struct_lookup(wret)
+                    if si != 0xFFFFFFFF {
+                        fn_ret_struct_register(wname, si)
+                    }
+                }
+            }
+        }
+        uint32 nxt = ast_next(wc)
+        wc = nxt
+    }
+}
+
+@export
+fn tc_check_module(uint64 root) {
+    tc_init()
+    // Snapshot codegen-side return-type table counts so we can roll them
+    // back after the pre-pass. Otherwise the pre-pass leaves duplicate
+    // entries that codegen's own walk then re-adds, eventually overflowing
+    // and (more subtly) shifting struct ABI decisions.
+    uint64 saved_struct_count = fn_ret_struct_count_get()
+    uint64 saved_float_count = fn_ret_float_count_get()
+    tc_collect_signatures(root)
+
+    uint32 child = ast_child(root)
+    uint64 wc = child
+    while wc != 0 {
+        uint32 ck = ast_kind(wc)
+        if ck == 2 {
+            tc_check_function(wc)
+        }
+        uint32 nxt = ast_next(wc)
+        wc = nxt
+    }
+
+    // Roll back the pre-pass entries so codegen starts from where we
+    // started. The diagnostics have already been emitted; the table
+    // entries were only needed during the walk.
+    fn_ret_struct_count_set(saved_struct_count)
+    fn_ret_float_count_set(saved_float_count)
+}

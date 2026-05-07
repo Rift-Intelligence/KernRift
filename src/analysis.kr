@@ -482,19 +482,26 @@ fn sema_tok_line(uint64 tok_idx) -> uint64 {
 // Diagnostic collection
 // ---------------------------------------------------------------------------
 
+// Diagnostic entry layout (16 bytes):
+//   0..3   tok_idx (uint32)
+//   4      severity (uint8)  — 0=error, 1=warning, 2=note
+//   5      msg_id   (uint8)  — legacy fixed-message id (0 if using msg_ptr)
+//   6..7   reserved
+//   8..15  msg_ptr  (uint64) — pointer to free-form string literal, or 0
 fn diag_init() {
     if diag_table == 0 {
-        diag_table = alloc(1024 * 8)
+        diag_table = alloc(1024 * 16)
     }
     diag_count = 0
     diag_error_count = 0
     diag_warn_count = 0
 }
 
+// Legacy emit: looks up the message via diag_msg_text(msg_id).
 // severity: 0 = error, 1 = warning
 fn diag_emit(uint64 tok_idx, uint64 severity, uint64 msg_id) {
     if diag_count >= 1024 { return }
-    uint64 entry = diag_table + diag_count * 8
+    uint64 entry = diag_table + diag_count * 16
     uint32 ti = tok_idx
     unsafe { *(entry as uint32) = ti }
     uint64 e4 = entry + 4
@@ -503,9 +510,117 @@ fn diag_emit(uint64 tok_idx, uint64 severity, uint64 msg_id) {
     uint64 e5 = entry + 5
     uint8 mid = msg_id
     unsafe { *(e5 as uint8) = mid }
+    uint64 e8 = entry + 8
+    unsafe { *(e8 as uint64) = 0 }
     diag_count = diag_count + 1
     if severity == 0 { diag_error_count = diag_error_count + 1 }
     if severity == 1 { diag_warn_count = diag_warn_count + 1 }
+}
+
+// New emit: free-form message via pointer to a string literal.
+// Caller controls the message text. Use this for type-checker rules.
+@export
+fn diag_emit_str(uint64 tok_idx, uint64 severity, uint64 msg_ptr) {
+    if diag_count >= 1024 { return }
+    uint64 entry = diag_table + diag_count * 16
+    uint32 ti = tok_idx
+    unsafe { *(entry as uint32) = ti }
+    uint64 e4 = entry + 4
+    uint8 sev = severity
+    unsafe { *(e4 as uint8) = sev }
+    uint64 e5 = entry + 5
+    unsafe { *(e5 as uint8) = 0 }
+    uint64 e8 = entry + 8
+    unsafe { *(e8 as uint64) = msg_ptr }
+    diag_count = diag_count + 1
+    if severity == 0 { diag_error_count = diag_error_count + 1 }
+    if severity == 1 { diag_warn_count = diag_warn_count + 1 }
+}
+
+// Column number = byte offset within the line (1-based).
+// Scan back from `start` to find the previous newline.
+fn diag_col_of(uint64 start) -> uint64 {
+    if sema_source == 0 { return 1 }
+    uint64 i = start
+    while i > 0 {
+        uint64 p = sema_source + i - 1
+        uint8 c = 0
+        unsafe { *(p as uint8) -> c }
+        if c == 10 { break }    // '\n'
+        i = i - 1
+    }
+    return start - i + 1
+}
+
+// Emit one caret line (spaces + '^' + '~'*(len-1)) aligned under the
+// source line that was already printed. Width should match the column
+// where the offending token starts; len is the token length.
+fn diag_print_carets(uint64 col, uint64 len) {
+    uint64 i = 1
+    while i < col {
+        write(2, " ", 1)
+        i = i + 1
+    }
+    write(2, "^", 1)
+    if len > 1 {
+        uint64 j = 1
+        while j < len {
+            write(2, "~", 1)
+            j = j + 1
+        }
+    }
+    write(2, "\n", 1)
+}
+
+// Print the source line containing byte offset `start`, plus a caret
+// underline of width `len` pointing at it. Output format:
+//
+//      42 | uint8 x = some_int64
+//         |            ^~~~~~~~~~~
+fn diag_print_source_line(uint64 start, uint64 len, uint64 line) {
+    if sema_source == 0 { return }
+    // Find line bounds: scan back to '\n' or BOF, forward to '\n' or EOF.
+    uint64 line_start = start
+    while line_start > 0 {
+        uint64 p = sema_source + line_start - 1
+        uint8 c = 0
+        unsafe { *(p as uint8) -> c }
+        if c == 10 { break }
+        line_start = line_start - 1
+    }
+    uint64 line_end = start
+    // We need src_len; reuse the existing srcmap end if reachable, else
+    // walk forward conservatively.
+    uint64 walk_cap = line_start + 4096
+    while line_end < walk_cap {
+        uint64 p = sema_source + line_end
+        uint8 c = 0
+        unsafe { *(p as uint8) -> c }
+        if c == 0 || c == 10 { break }
+        line_end = line_end + 1
+    }
+    // Print "    LL | <line>\n"
+    write(2, "  ", 2)
+    uint8[24] lbuf
+    uint64 llen = fmt_uint(lbuf, line)
+    // Right-align to width 4
+    uint64 pad = 4
+    if llen < pad {
+        uint64 sp = pad - llen
+        while sp > 0 { write(2, " ", 1); sp = sp - 1 }
+    }
+    write(2, lbuf, llen)
+    write(2, " | ", 3)
+    uint64 lline = line_end - line_start
+    write(2, sema_source + line_start, lline)
+    write(2, "\n", 1)
+    // Print "       | <spaces>^~~~\n"
+    write(2, "  ", 2)
+    uint64 sp2 = pad
+    while sp2 > 0 { write(2, " ", 1); sp2 = sp2 - 1 }
+    write(2, " | ", 3)
+    uint64 col = start - line_start
+    diag_print_carets(col + 1, len)
 }
 
 fn diag_msg_text(uint64 msg_id) -> uint64 {
@@ -529,7 +644,7 @@ fn diag_msg_text(uint64 msg_id) -> uint64 {
 fn diag_report_all() {
     uint64 i = 0
     while i < diag_count {
-        uint64 entry = diag_table + i * 8
+        uint64 entry = diag_table + i * 16
         uint32 ti = 0
         unsafe { *(entry as uint32) -> ti }
         uint64 wti = ti
@@ -541,28 +656,44 @@ fn diag_report_all() {
         uint8 mid = 0
         unsafe { *(e5 as uint8) -> mid }
         uint64 wmid = mid
-        // Use sema_source for token text access
+        uint64 e8 = entry + 8
+        uint64 mptr = 0
+        unsafe { *(e8 as uint64) -> mptr }
+
         uint64 tstart = sema_tok_text_start(wti)
         uint64 tlen = sema_tok_text_len(wti)
-        // Print file:line from srcmap
+        uint64 tok_line = sema_tok_line(wti)
+        uint64 col = diag_col_of(tstart)
+
+        // Print "file:line:col: severity: message"
         uint64 file_path = srcmap_file(tstart)
         if file_path != 0 { write(2, file_path, str_len(file_path)) }
         write(2, ":", 1)
         uint8[24] lbuf
-        uint64 tok_line = sema_tok_line(wti)
         uint64 llen = fmt_uint(lbuf, tok_line)
         write(2, lbuf, llen)
+        write(2, ":", 1)
+        uint64 clen = fmt_uint(lbuf, col)
+        write(2, lbuf, clen)
         if wsev == 0 { write(2, ": error: ", 9) }
         if wsev == 1 { write(2, ": warning: ", 11) }
-        uint64 msg = diag_msg_text(wmid)
-        write(2, msg, str_len(msg))
-        // Append variable name for relevant diagnostics
-        if wmid == 1 || wmid == 3 || wmid == 4 || wmid == 9 {
-            write(2, " '", 2)
-            write(2, sema_source + tstart, tlen)
-            write(2, "'", 1)
+        if wsev == 2 { write(2, ": note: ", 8) }
+        // Free-form message takes precedence; else look up by id.
+        if mptr != 0 {
+            write(2, mptr, str_len(mptr))
+        } else {
+            uint64 msg = diag_msg_text(wmid)
+            write(2, msg, str_len(msg))
+            // Append variable name for legacy diagnostics that need it.
+            if wmid == 1 || wmid == 3 || wmid == 4 || wmid == 9 {
+                write(2, " '", 2)
+                write(2, sema_source + tstart, tlen)
+                write(2, "'", 1)
+            }
         }
         write(2, "\n", 1)
+        // Source line + caret pointer
+        diag_print_source_line(tstart, tlen, tok_line)
         i = i + 1
     }
     // Summary line
@@ -831,6 +962,27 @@ fn fn_sig_lookup(uint64 name_tok) -> uint64 {
             uint32 pc = 0
             unsafe { *(e4 as uint32) -> pc }
             return pc
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Returns 1 if the named fn has a non-void return type; 0 if void;
+// 0xFFFFFFFF if the fn isn't in the signature table (extern / builtin).
+@export
+fn fn_sig_returns(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < fn_sig_count {
+        uint64 entry = fn_sig_table + i * 16
+        uint32 stored_tok = 0
+        unsafe { *(entry as uint32) -> stored_tok }
+        uint64 wst = stored_tok
+        if sema_tok_text_eq(wst, name_tok) != 0 {
+            uint64 e8 = entry + 8
+            uint32 hr = 0
+            unsafe { *(e8 as uint32) -> hr }
+            return hr
         }
         i = i + 1
     }

@@ -2123,6 +2123,17 @@ fn emit_store_xmmN_f64(uint64 reg, uint64 offset) {
     }
 }
 
+// Pre-pass helpers used by the type checker to register return-types
+// before codegen runs without leaving stray duplicates behind.
+@export
+fn fn_ret_struct_count_get() -> uint64 { return fn_ret_struct_count }
+@export
+fn fn_ret_struct_count_set(uint64 v) { fn_ret_struct_count = v }
+@export
+fn fn_ret_float_count_get() -> uint64 { return fn_ret_float_count }
+@export
+fn fn_ret_float_count_set(uint64 v) { fn_ret_float_count = v }
+
 // Register a function's float return type
 fn fn_ret_float_register(uint64 name_tok, uint64 float_kind) {
     if fn_ret_float_count >= 512 {
