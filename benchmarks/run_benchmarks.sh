@@ -108,6 +108,8 @@ compile_bench "fib"
 compile_bench "sort"
 compile_bench "sieve"
 compile_bench "matmul"
+compile_bench "mandelbrot"
+compile_bench "sha256"
 
 # Cleanup binaries
 rm -f "$DIR"/*.bin

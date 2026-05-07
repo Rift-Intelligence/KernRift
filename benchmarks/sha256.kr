@@ -1,0 +1,193 @@
+// SHA-256 of a 16 MiB buffer of zeros. See sha256.c for the spec.
+
+// Round constants K[64], stored in a heap-allocated table built once.
+static uint64 K_table = 0
+
+fn k_init() {
+    if K_table != 0 { return }
+    K_table = alloc(64 * 4)
+    uint32[64] vals
+    vals[0]  = 0x428a2f98; vals[1]  = 0x71374491; vals[2]  = 0xb5c0fbcf; vals[3]  = 0xe9b5dba5
+    vals[4]  = 0x3956c25b; vals[5]  = 0x59f111f1; vals[6]  = 0x923f82a4; vals[7]  = 0xab1c5ed5
+    vals[8]  = 0xd807aa98; vals[9]  = 0x12835b01; vals[10] = 0x243185be; vals[11] = 0x550c7dc3
+    vals[12] = 0x72be5d74; vals[13] = 0x80deb1fe; vals[14] = 0x9bdc06a7; vals[15] = 0xc19bf174
+    vals[16] = 0xe49b69c1; vals[17] = 0xefbe4786; vals[18] = 0x0fc19dc6; vals[19] = 0x240ca1cc
+    vals[20] = 0x2de92c6f; vals[21] = 0x4a7484aa; vals[22] = 0x5cb0a9dc; vals[23] = 0x76f988da
+    vals[24] = 0x983e5152; vals[25] = 0xa831c66d; vals[26] = 0xb00327c8; vals[27] = 0xbf597fc7
+    vals[28] = 0xc6e00bf3; vals[29] = 0xd5a79147; vals[30] = 0x06ca6351; vals[31] = 0x14292967
+    vals[32] = 0x27b70a85; vals[33] = 0x2e1b2138; vals[34] = 0x4d2c6dfc; vals[35] = 0x53380d13
+    vals[36] = 0x650a7354; vals[37] = 0x766a0abb; vals[38] = 0x81c2c92e; vals[39] = 0x92722c85
+    vals[40] = 0xa2bfe8a1; vals[41] = 0xa81a664b; vals[42] = 0xc24b8b70; vals[43] = 0xc76c51a3
+    vals[44] = 0xd192e819; vals[45] = 0xd6990624; vals[46] = 0xf40e3585; vals[47] = 0x106aa070
+    vals[48] = 0x19a4c116; vals[49] = 0x1e376c08; vals[50] = 0x2748774c; vals[51] = 0x34b0bcb5
+    vals[52] = 0x391c0cb3; vals[53] = 0x4ed8aa4a; vals[54] = 0x5b9cca4f; vals[55] = 0x682e6ff3
+    vals[56] = 0x748f82ee; vals[57] = 0x78a5636f; vals[58] = 0x84c87814; vals[59] = 0x8cc70208
+    vals[60] = 0x90befffa; vals[61] = 0xa4506ceb; vals[62] = 0xbef9a3f7; vals[63] = 0xc67178f2
+    memcpy(K_table, vals, 64 * 4)
+}
+
+fn k_at(uint64 i) -> uint64 {
+    uint64 p = K_table + i * 4
+    uint32 v = 0
+    unsafe { *(p as uint32) -> v }
+    return v
+}
+
+fn rotr32(uint64 x, uint64 n) -> uint64 {
+    uint64 lo = (x >> n) & 0xFFFFFFFF
+    uint64 hi = (x << (32 - n)) & 0xFFFFFFFF
+    return (lo | hi) & 0xFFFFFFFF
+}
+
+// Load a u32 from buf+off, big-endian.
+fn load_be32(uint64 buf, uint64 off) -> uint64 {
+    uint64 p0 = buf + off
+    uint64 p1 = buf + off + 1
+    uint64 p2 = buf + off + 2
+    uint64 p3 = buf + off + 3
+    uint64 b0 = 0
+    uint64 b1 = 0
+    uint64 b2 = 0
+    uint64 b3 = 0
+    unsafe { *(p0 as uint8) -> b0 }
+    unsafe { *(p1 as uint8) -> b1 }
+    unsafe { *(p2 as uint8) -> b2 }
+    unsafe { *(p3 as uint8) -> b3 }
+    return ((b0 & 0xFF) << 24) | ((b1 & 0xFF) << 16) | ((b2 & 0xFF) << 8) | (b3 & 0xFF)
+}
+
+fn store_u32(uint64 buf, uint64 idx, uint64 v) {
+    uint64 p = buf + idx * 4
+    uint32 v32 = v & 0xFFFFFFFF
+    unsafe { *(p as uint32) = v32 }
+}
+
+fn load_u32(uint64 buf, uint64 idx) -> uint64 {
+    uint64 p = buf + idx * 4
+    uint32 v = 0
+    unsafe { *(p as uint32) -> v }
+    return v
+}
+
+// Reusable W buffer — allocated once, scrubbed implicitly by overwrite.
+static uint64 W_global = 0
+
+// SHA-256 compress: update state H[8] from one 64-byte block.
+fn sha256_compress(uint64 H, uint64 block) {
+    if W_global == 0 { W_global = alloc(64 * 4) }
+    uint64 W = W_global
+    uint64 i = 0
+    while i < 16 {
+        uint64 w = load_be32(block, i * 4)
+        store_u32(W, i, w)
+        i = i + 1
+    }
+    i = 16
+    while i < 64 {
+        uint64 w15 = load_u32(W, i - 15)
+        uint64 w2 = load_u32(W, i - 2)
+        uint64 s0 = (rotr32(w15, 7) ^ rotr32(w15, 18) ^ (w15 >> 3)) & 0xFFFFFFFF
+        uint64 s1 = (rotr32(w2, 17) ^ rotr32(w2, 19) ^ (w2 >> 10)) & 0xFFFFFFFF
+        uint64 w16 = load_u32(W, i - 16)
+        uint64 w7 = load_u32(W, i - 7)
+        uint64 wi = (w16 + s0 + w7 + s1) & 0xFFFFFFFF
+        store_u32(W, i, wi)
+        i = i + 1
+    }
+    uint64 a = load_u32(H, 0)
+    uint64 b = load_u32(H, 1)
+    uint64 c = load_u32(H, 2)
+    uint64 d = load_u32(H, 3)
+    uint64 e = load_u32(H, 4)
+    uint64 f = load_u32(H, 5)
+    uint64 g = load_u32(H, 6)
+    uint64 hh = load_u32(H, 7)
+    i = 0
+    while i < 64 {
+        uint64 S1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) & 0xFFFFFFFF
+        uint64 ch = ((e & f) ^ ((~e) & g)) & 0xFFFFFFFF
+        uint64 wi = load_u32(W, i)
+        uint64 t1 = (hh + S1 + ch + k_at(i) + wi) & 0xFFFFFFFF
+        uint64 S0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) & 0xFFFFFFFF
+        uint64 mj = ((a & b) ^ (a & c) ^ (b & c)) & 0xFFFFFFFF
+        uint64 t2 = (S0 + mj) & 0xFFFFFFFF
+        hh = g
+        g = f
+        f = e
+        e = (d + t1) & 0xFFFFFFFF
+        d = c
+        c = b
+        b = a
+        a = (t1 + t2) & 0xFFFFFFFF
+        i = i + 1
+    }
+    store_u32(H, 0, (load_u32(H, 0) + a) & 0xFFFFFFFF)
+    store_u32(H, 1, (load_u32(H, 1) + b) & 0xFFFFFFFF)
+    store_u32(H, 2, (load_u32(H, 2) + c) & 0xFFFFFFFF)
+    store_u32(H, 3, (load_u32(H, 3) + d) & 0xFFFFFFFF)
+    store_u32(H, 4, (load_u32(H, 4) + e) & 0xFFFFFFFF)
+    store_u32(H, 5, (load_u32(H, 5) + f) & 0xFFFFFFFF)
+    store_u32(H, 6, (load_u32(H, 6) + g) & 0xFFFFFFFF)
+    store_u32(H, 7, (load_u32(H, 7) + hh) & 0xFFFFFFFF)
+}
+
+// Print a 32-bit value as 8 hex chars to stdout via write(1).
+fn print_hex32(uint64 v) {
+    uint8[8] buf
+    uint64 i = 0
+    while i < 8 {
+        uint64 nybble = (v >> ((7 - i) * 4)) & 0xF
+        uint8 ch = 0
+        if nybble < 10 {
+            ch = 48 + nybble
+        } else {
+            ch = 87 + nybble
+        }
+        uint64 p = buf + i
+        unsafe { *(p as uint8) = ch }
+        i = i + 1
+    }
+    write(1, buf, 8)
+}
+
+fn main() {
+    k_init()
+    uint64 N = 16 * 1024 * 1024
+    uint64 pad_end = ((N + 9 + 63) / 64) * 64
+    uint64 buf = alloc(pad_end)
+    memset(buf, 0, pad_end)
+    uint64 first_pad = buf + N
+    uint8 b80 = 0x80
+    unsafe { *(first_pad as uint8) = b80 }
+    uint64 bit_len = N * 8
+    uint64 i = 0
+    while i < 8 {
+        uint64 p = buf + pad_end - 1 - i
+        uint8 byt = (bit_len >> (i * 8)) & 0xFF
+        unsafe { *(p as uint8) = byt }
+        i = i + 1
+    }
+    uint64 H = alloc(8 * 4)
+    store_u32(H, 0, 0x6a09e667)
+    store_u32(H, 1, 0xbb67ae85)
+    store_u32(H, 2, 0x3c6ef372)
+    store_u32(H, 3, 0xa54ff53a)
+    store_u32(H, 4, 0x510e527f)
+    store_u32(H, 5, 0x9b05688c)
+    store_u32(H, 6, 0x1f83d9ab)
+    store_u32(H, 7, 0x5be0cd19)
+    uint64 off = 0
+    while off < pad_end {
+        sha256_compress(H, buf + off)
+        off = off + 64
+    }
+    i = 0
+    while i < 8 {
+        print_hex32(load_u32(H, i))
+        i = i + 1
+    }
+    write(1, "\n", 1)
+    dealloc(H)
+    dealloc(buf)
+    exit(0)
+}

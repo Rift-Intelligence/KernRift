@@ -1,0 +1,43 @@
+// Mandelbrot escape-time count. See mandelbrot.c for the spec.
+fn main() {
+    uint64 W = 1024
+    uint64 H = 1024
+    uint64 MAX_ITER = 1000
+    f64 fW = int_to_f64(W)
+    f64 fH = int_to_f64(H)
+    f64 two = 2.0
+    f64 three = 3.0
+    f64 one = 1.0
+    f64 minus_two = -2.0
+    f64 zero = 0.0
+    f64 four = 4.0
+    uint64 sum = 0
+    uint64 py = 0
+    while py < H {
+        f64 fpy = int_to_f64(py)
+        f64 y0 = fpy / fH * two - one
+        uint64 px = 0
+        while px < W {
+            f64 fpx = int_to_f64(px)
+            f64 x0 = fpx / fW * three + minus_two
+            f64 x = zero
+            f64 y = zero
+            uint64 iter = 0
+            f64 xx = x * x
+            f64 yy = y * y
+            while xx + yy <= four && iter < MAX_ITER {
+                f64 xt = xx - yy + x0
+                y = two * x * y + y0
+                x = xt
+                xx = x * x
+                yy = y * y
+                iter = iter + 1
+            }
+            sum = sum + iter
+            px = px + 1
+        }
+        py = py + 1
+    }
+    println(sum)
+    exit(0)
+}
