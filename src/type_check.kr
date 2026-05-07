@@ -15,6 +15,13 @@
 //   B2  assign-struct-kind         — assigning struct A to a struct B variable
 //   B6  compare-on-struct          — `==`/`!=`/`<` etc. with a struct operand
 //
+// Phase 3 rules (also errors — zero violations on the self-host):
+//   B3  return-struct-mismatch     — returning wrong struct kind / non-struct
+//   C7  return-float-kind-mismatch — returning f32 from f64 fn (or reverse)
+//   C6  call-arg-struct-mismatch   — passing struct B where param is A, or
+//                                    a non-struct where a struct is expected
+//   C10 match-arm-type-mismatch    — pattern type incompatible with scrutinee
+//
 // TypeKind tags reuse the lexer's type-keyword token kinds where possible:
 //   0     = unknown / unresolved
 //   1     = void
@@ -42,6 +49,42 @@ static uint64 tc_local_cap = 0
 static uint64 tc_current_ret_kind = 0
 static uint64 tc_current_fn_tok = 0
 
+// Fn-node index by name token, populated by tc_collect_signatures so
+// that Call type-checking can find the callee's params without scanning
+// the whole module on every Call.
+// Layout: [name_tok(4), fn_node_idx(4)] x 1024.
+static uint64 tc_fn_node_table = 0
+static uint64 tc_fn_node_count = 0
+
+fn tc_fn_node_register(uint64 name_tok, uint64 fn_node) {
+    if tc_fn_node_count >= 1024 { return }
+    uint64 entry = tc_fn_node_table + tc_fn_node_count * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 fn32 = fn_node
+    unsafe { *(e4 as uint32) = fn32 }
+    tc_fn_node_count = tc_fn_node_count + 1
+}
+
+fn tc_fn_node_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < tc_fn_node_count {
+        uint64 entry = tc_fn_node_table + i * 8
+        uint32 nt = 0
+        unsafe { *(entry as uint32) -> nt }
+        uint64 wnt = nt
+        if tok_text_eq(wnt, name_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 fn32 = 0
+            unsafe { *(e4 as uint32) -> fn32 }
+            return fn32
+        }
+        i = i + 1
+    }
+    return 0
+}
+
 @export
 fn tc_init() {
     if tc_local_table == 0 {
@@ -49,6 +92,10 @@ fn tc_init() {
         tc_local_table = alloc(tc_local_cap * 8)
     }
     tc_local_count = 0
+    if tc_fn_node_table == 0 {
+        tc_fn_node_table = alloc(1024 * 8)
+    }
+    tc_fn_node_count = 0
 }
 
 fn tc_local_register(uint64 name_tok, uint64 typekind) {
@@ -209,12 +256,51 @@ fn tc_check_expr(uint64 node) {
 
     // Call (35): walk args via child→next (this IS a list).
     if wkind == 35 {
+        // Walk args first so their sub-expressions get checked.
         uint32 arg = ast_child(node)
         uint64 warg = arg
         while warg != 0 {
             tc_check_expr(warg)
             uint32 anxt = ast_next(warg)
             warg = anxt
+        }
+        // ---- C6: call-arg type mismatch ----
+        // Look up the callee's FnDecl and walk its params alongside args.
+        // Skip if callee is unknown (extern / builtin / forward-declared
+        // outside the current module).
+        uint32 callee = ast_data1(node)
+        uint64 wcallee = callee
+        uint64 fn_node = tc_fn_node_lookup(wcallee)
+        if fn_node != 0 {
+            uint32 param = ast_child(fn_node)
+            uint64 wp = param
+            uint32 ai = ast_child(node)
+            uint64 wai = ai
+            while wp != 0 && wai != 0 {
+                uint32 pk = ast_kind(wp)
+                if pk != 3 { wp = 0 }   // not a Param — break out
+                if pk == 3 {
+                    // Param's declared type.
+                    uint32 ptype_tok = ast_data1(wp)
+                    uint64 expected = tc_kind_of_type_tok(ptype_tok)
+                    uint64 actual = tc_expr_kind(wai)
+                    if expected != 0 && actual != 0 && actual != 0xFFFFFFFF {
+                        uint64 e_struct = tc_is_struct_kind(expected)
+                        uint64 a_struct = tc_is_struct_kind(actual)
+                        if e_struct != a_struct {
+                            uint32 atok = ast_tok(wai)
+                            diag_emit_str(atok, 0, "argument struct/non-struct mismatch")
+                        } else if e_struct != 0 && expected != actual {
+                            uint32 atok = ast_tok(wai)
+                            diag_emit_str(atok, 0, "argument struct kind does not match parameter type")
+                        }
+                    }
+                    uint32 pn = ast_next(wp)
+                    wp = pn
+                    uint32 anxt2 = ast_next(wai)
+                    wai = anxt2
+                }
+            }
         }
         return
     }
@@ -423,6 +509,27 @@ fn tc_check_stmt(uint64 node) {
                     uint32 rt = ast_tok(node)
                     diag_emit_str(rt, 0, "returning the result of a void-returning function")
                 }
+                // ---- B3: struct return-type mismatch ----
+                // ---- C7: float return-kind mismatch ----
+                uint64 rk = tc_expr_kind(wexpr)
+                if rk != 0 && rk != 0xFFFFFFFF {
+                    uint64 lhs_struct = tc_is_struct_kind(tc_current_ret_kind)
+                    uint64 rhs_struct = tc_is_struct_kind(rk)
+                    if lhs_struct != rhs_struct {
+                        uint32 rt = ast_tok(node)
+                        diag_emit_str(rt, 0, "return value struct/non-struct mismatch")
+                    } else if lhs_struct != 0 && tc_current_ret_kind != rk {
+                        uint32 rt = ast_tok(node)
+                        diag_emit_str(rt, 0, "return value struct kind does not match declared type")
+                    }
+                    // C7: float-kind: f32 vs f64 (skip if either side is unknown).
+                    if tc_is_float_kind(tc_current_ret_kind) != 0 && tc_is_float_kind(rk) != 0 {
+                        if tc_current_ret_kind != rk {
+                            uint32 rt = ast_tok(node)
+                            diag_emit_str(rt, 0, "return value float kind does not match declared type")
+                        }
+                    }
+                }
             }
         }
         return
@@ -457,6 +564,67 @@ fn tc_check_stmt(uint64 node) {
         uint32 elseb = ast_data2(node)
         uint64 we = elseb
         if we != 0 { tc_check_stmt(we) }
+        return
+    }
+
+    // Match (19): child=scrutinee, data1=first_arm.
+    // Each arm (kind 20): data1=first_pattern (linked via next),
+    // data2=body_block, next=next_arm.
+    if wkind == 19 {
+        uint32 scrut = ast_child(node)
+        uint64 wscrut = scrut
+        if wscrut != 0 { tc_check_expr(wscrut) }
+        uint64 sk = tc_expr_kind(wscrut)
+
+        uint32 arm = ast_data1(node)
+        uint64 warm = arm
+        while warm != 0 {
+            uint32 ak = ast_kind(warm)
+            if ak == 20 {
+                // Walk all patterns chained from data1 via next.
+                uint32 pat = ast_data1(warm)
+                uint64 wpat = pat
+                while wpat != 0 {
+                    uint32 pk = ast_kind(wpat)
+                    // Skip wildcards: a bare Ident named "_" by convention,
+                    // or any Ident not tied to a known local (catch-all).
+                    uint64 skip = 0
+                    if pk == 32 {
+                        // Ident: only treat as a real pattern if it
+                        // resolves to a known local. Otherwise it's a
+                        // pattern binding / wildcard — let it through.
+                        uint32 nt = ast_data1(wpat)
+                        uint64 wnt = nt
+                        if tc_local_lookup(wnt) == 0 { skip = 1 }
+                    }
+                    if pk == 52 { skip = 1 }   // RangePat — skip for now
+                    if skip == 0 {
+                        uint64 pkk = tc_expr_kind(wpat)
+                        if pkk != 0 && pkk != 0xFFFFFFFF
+                                && sk != 0 && sk != 0xFFFFFFFF {
+                            uint64 s_struct = tc_is_struct_kind(sk)
+                            uint64 p_struct = tc_is_struct_kind(pkk)
+                            if s_struct != p_struct {
+                                uint32 pt = ast_tok(wpat)
+                                diag_emit_str(pt, 0, "match-arm pattern struct/non-struct mismatch")
+                            } else if s_struct != 0 && sk != pkk {
+                                uint32 pt = ast_tok(wpat)
+                                diag_emit_str(pt, 0, "match-arm pattern struct kind does not match scrutinee")
+                            }
+                        }
+                        tc_check_expr(wpat)
+                    }
+                    uint32 pn = ast_next(wpat)
+                    wpat = pn
+                }
+                // Walk arm body.
+                uint32 body = ast_data2(warm)
+                uint64 wbody = body
+                if wbody != 0 { tc_check_stmt(wbody) }
+            }
+            uint32 anxt = ast_next(warm)
+            warm = anxt
+        }
         return
     }
 
@@ -522,8 +690,9 @@ fn tc_check_function(uint64 fn_node) {
 }
 
 // Pre-pass: walk FnDecls and seed fn_ret_struct_table / fn_ret_float_table
-// so tc_expr_kind can resolve Call return types. Codegen does this later
-// in its own walk; we need it here, before codegen runs.
+// (so tc_expr_kind can resolve Call return types) AND populate the
+// type-checker's name → fn_node lookup table (so Call argument
+// type-checking can find the callee's params without a full module scan).
 fn tc_collect_signatures(uint64 root) {
     uint32 child = ast_child(root)
     uint64 wc = child
@@ -534,6 +703,7 @@ fn tc_collect_signatures(uint64 root) {
             uint32 ret_tok = ast_data2(wc)
             uint64 wname = fname
             uint64 wret = ret_tok
+            tc_fn_node_register(wname, wc)
             if wret != 0 {
                 uint64 rk = tok_kind_at_raw(wret)
                 if rk == 96 { fn_ret_float_register(wname, 1) }
