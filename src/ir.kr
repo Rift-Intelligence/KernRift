@@ -141,6 +141,32 @@ static uint64 IR_ARR_CHECK = 131    // bounds check: trap if s1_v (idx) >= imm (
 static uint64 IR_SDIV = 132         // dest = src1 / src2 (signed): cqo + idiv on x86, sdiv on a64
 static uint64 IR_SMOD = 133         // dest = src1 % src2 (signed): cqo + idiv (rdx) on x86, sdiv+msub on a64
 static uint64 IR_SAR = 134          // dest = src1 >> src2 (arithmetic): SAR (modrm /7) on x86, ASR on a64
+// LEA-fused arithmetic: src1 vreg + signed-32 immediate. src2 is unused; imm
+// holds the displacement. Emitted as `lea dst, [src1 ± imm]` (3-7 bytes) on
+// x86 — replaces `mov const; mov src1; add/sub` (8-13 bytes) for the very
+// common pattern of `n - 1`, `i + 4`, etc. Const-fold rewrites IR_ADD/SUB to
+// these when src2 is a known constant fitting in signed 32-bit.
+static uint64 IR_ADD_IMM = 135      // dest = src1 + imm (signed i32)
+static uint64 IR_SUB_IMM = 136      // dest = src1 - imm (signed i32)
+
+// 32-bit right-rotation: dest = ROR_w(src1, src2). imm = rotation width
+// (32 or 64). Synthesized by ir_opt_recognize_rotate from the canonical
+// `OR(AND(SHR(x,n), MASK), AND(SHL(x, W-n), MASK))` shape that 32-bit
+// rotation idioms produce on a 64-bit IR. Codegen emits a single x86
+// `ROR r32, cl` (or imm8) when imm == 32.
+static uint64 IR_ROR = 137          // dest = ((src1 >> src2) | (src1 << (W - src2))) & ((1<<W)-1)
+// IMUL r64, r/m64, imm — three-operand form. Eliminates the load-and-
+// spill round-trip for the constant when src2 came from IR_CONST. Saves
+// 4-9 bytes per IR_MUL site that scales by a small constant
+// (matmul / sort / address-scaling are full of these). Only fires for
+// imm fitting in signed 32-bit; src2 is left unused.
+static uint64 IR_MUL_IMM = 138      // dest = src1 * imm (signed i32)
+// Base + index*scale LEA fusion. Encodes `dst = src1 + src2 * imm`
+// where imm ∈ {1, 2, 4, 8} — exactly x86's SIB scale set. Replaces the
+// `imul idx, idx, scale; mov tmp, base; add tmp, idx` 7-10 byte
+// sequence with a single 4-byte `lea dst, [base + idx*scale]`. Used by
+// matmul / sort hot loops that pun on byte-offset address math.
+static uint64 IR_LEA_BIS = 139      // dest = src1 + src2 * imm  (imm ∈ {1,2,4,8})
 
 // ---------------------------------------------------------------------------
 // Instruction arena
@@ -4573,7 +4599,7 @@ fn ir_compute_liveness() {
 
                 // Add src2 use
                 uint64 use2 = ir_insn_src2(cur_ii)
-                if use2 < ir_vreg_next && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 {
+                if use2 < ir_vreg_next && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 && op != 135 && op != 136 && op != 138 {
                     uint64 uw = use2 / 64
                     uint64 ub = use2 & 63
                     uint64 up = tmp + uw * 8
@@ -4641,7 +4667,7 @@ fn ir_compute_use_count() {
             }
         }
         uint64 s2 = ir_insn_src2(i)
-        if s2 != 0 && s2 < ir_vreg_next && s2 < ir_use_count_cap && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 {
+        if s2 != 0 && s2 < ir_vreg_next && s2 < ir_use_count_cap && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 && op != 135 && op != 136 && op != 138 {
             uint64 p = ir_use_count_buf + s2
             uint8 c = 0
             unsafe { *(p as uint8) -> c }
@@ -4994,7 +5020,7 @@ fn ir_graph_color() {
                     unsafe { *(up as uint64) = uv }
                 }
                 uint64 u2 = ir_insn_src2(ii)
-                if u2 > 0 && u2 < vcount && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 {
+                if u2 > 0 && u2 < vcount && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 && op != 135 && op != 136 && op != 138 {
                     uint64 uw = u2 / 64
                     uint64 ub = u2 & 63
                     uint64 up = tmp + uw * 8
@@ -5421,6 +5447,42 @@ fn ir_emit_cmp_r64_r64(uint64 a, uint64 b) {
     emit_byte(ir_x86_modrm_rr(b, a))
 }
 
+// Emit `cmp r64, imm` with the smallest applicable encoding:
+//   imm == 0                        → `test r,r`     (3 bytes)
+//   -128 <= signed(imm) <= 127      → `cmp r/m64, imm8`  (4 bytes)
+//   otherwise (signed-32 fits)      → `cmp r/m64, imm32` (7 bytes)
+// Caller must have already verified the imm fits in signed 32 bits.
+fn ir_emit_cmp_r64_imm(uint64 a, uint64 imm) {
+    if imm == 0 {
+        // test r/m64, r64 = REX.W 85 /r — same opcode as the helper.
+        ir_emit_test_r64_r64(a, a)
+        return
+    }
+    uint8 rex = 0x48
+    if a >= 8 { rex = rex | 1 }
+    uint64 use_imm8 = 0
+    if imm <= 127 { use_imm8 = 1 }
+    if imm >= 0xFFFFFFFFFFFFFF80 { use_imm8 = 1 }
+    if use_imm8 != 0 {
+        // 83 /7 ib
+        emit_byte(rex)
+        emit_byte(0x83)
+        uint64 mv = 0xC0 | (7 << 3) | (a & 7)
+        uint8 modrm = mv
+        emit_byte(modrm)
+        uint8 d8 = imm
+        emit_byte(d8)
+    } else {
+        // 81 /7 id
+        emit_byte(rex)
+        emit_byte(0x81)
+        uint64 mv = 0xC0 | (7 << 3) | (a & 7)
+        uint8 modrm = mv
+        emit_byte(modrm)
+        emit_u32_le(imm)
+    }
+}
+
 fn ir_emit_test_r64_r64(uint64 a, uint64 b) {
     emit_byte(ir_x86_rex(b, a))
     emit_byte(0x85)
@@ -5432,6 +5494,66 @@ fn ir_emit_imul_r64_r64(uint64 dst, uint64 src) {
     emit_byte(0x0F)
     emit_byte(0xAF)
     emit_byte(ir_x86_modrm_rr(dst, src))
+}
+
+// Emit `lea dst, [src + disp]` where disp is a signed-32-bit displacement
+// stored in a uint64. Handles RSP/R12 base registers (which require a SIB
+// byte) and picks disp8 vs disp32 to minimize bytes. Caller must have
+// verified disp fits in signed 32-bit and is non-zero (zero disp would
+// emit LEA-as-copy which is pointless — caller should rewrite to MOV).
+fn ir_emit_lea_disp(uint64 dst, uint64 src, uint64 disp) {
+    uint8 rex = 0x48
+    if dst >= 8 { rex = rex | 4 }
+    if src >= 8 { rex = rex | 1 }
+    emit_byte(rex)
+    emit_byte(0x8D)
+
+    uint64 src_lo = src & 7
+    uint64 dst_lo = dst & 7
+
+    // disp8 if disp is in [-128, 127] as a signed value.
+    uint64 use_disp8 = 0
+    if disp <= 127 { use_disp8 = 1 }
+    if disp >= 0xFFFFFFFFFFFFFF80 { use_disp8 = 1 }
+
+    if src_lo == 4 {
+        // base register encoded as RSP (rsp/r12) — ModRM r/m=100 means a
+        // SIB byte follows. SIB 0x24 = scale=00, index=100 (no index),
+        // base=100 (the actual base register).
+        if use_disp8 != 0 {
+            uint64 mv = 0x44 | (dst_lo << 3)
+            uint8 modrm = mv
+            emit_byte(modrm)
+            emit_byte(0x24)
+            uint8 d8 = disp
+            emit_byte(d8)
+        } else {
+            uint64 mv = 0x84 | (dst_lo << 3)
+            uint8 modrm = mv
+            emit_byte(modrm)
+            emit_byte(0x24)
+            emit_u32_le(disp)
+        }
+        return
+    }
+
+    // base register encoded as RBP (rbp/r13) with no displacement collides
+    // with the RIP-relative encoding (mod=00, r/m=101). Force a disp8 of 0
+    // when disp would otherwise be elided. Our caller guarantees disp != 0,
+    // so the disp8 path is always safe — no special case needed.
+
+    if use_disp8 != 0 {
+        uint64 mv = 0x40 | (dst_lo << 3) | src_lo
+        uint8 modrm = mv
+        emit_byte(modrm)
+        uint8 d8 = disp
+        emit_byte(d8)
+    } else {
+        uint64 mv = 0x80 | (dst_lo << 3) | src_lo
+        uint8 modrm = mv
+        emit_byte(modrm)
+        emit_u32_le(disp)
+    }
 }
 
 fn ir_emit_neg_r64(uint64 reg) {
@@ -6017,6 +6139,142 @@ fn ir_emit_x86_insn(uint64 ii) {
         return
     }
 
+    if op == 135 || op == 136 {
+        // IR_ADD_IMM / IR_SUB_IMM: dst = src1 ± imm via `lea dst, [src1+disp]`.
+        // For SUB_IMM, negate the displacement so we can share the LEA path.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 disp = imm
+        if op == 136 { disp = 0 - imm }
+        uint64 lea_dst = dst_r
+        if lea_dst == 0xFFFFFFFF { lea_dst = 0 }
+        ir_emit_lea_disp(lea_dst, a_reg, disp)
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 139 {
+        // IR_LEA_BIS: dst = base + idx * scale  (scale ∈ {1,2,4,8})
+        // Encoding: REX.W [+R/X/B] + 0x8D + ModRM(mod, reg=dst, r/m=100)
+        //                   + SIB(scale_bits, idx, base) [+ disp8 if base=rbp/r13]
+        uint64 base_reg = ir_resolve_src(s1_v, 0)
+        uint64 idx_reg = ir_resolve_src(s2_v, 1)
+        uint64 dst = dst_r
+        if dst == 0xFFFFFFFF { dst = 0 }
+        uint8 rex = 0x48
+        if dst >= 8 { rex = rex | 4 }
+        if idx_reg >= 8 { rex = rex | 2 }
+        if base_reg >= 8 { rex = rex | 1 }
+        emit_byte(rex)
+        emit_byte(0x8D)
+        uint64 scale_bits = 0
+        if imm == 2 { scale_bits = 1 }
+        if imm == 4 { scale_bits = 2 }
+        if imm == 8 { scale_bits = 3 }
+        uint64 base_lo = base_reg & 7
+        uint64 idx_lo = idx_reg & 7
+        uint64 dst_lo = dst & 7
+        // RBP/R13 base requires explicit disp8=0 (mod=00 r/m=101 means
+        // RIP-relative which is incompatible with SIB-base semantics).
+        if base_lo == 5 {
+            uint64 mv = 0x40 | (dst_lo << 3) | 4
+            uint8 modrm = mv
+            emit_byte(modrm)
+            uint64 sv = (scale_bits << 6) | (idx_lo << 3) | base_lo
+            uint8 sib = sv
+            emit_byte(sib)
+            emit_byte(0)
+        } else {
+            uint64 mv = (dst_lo << 3) | 4
+            uint8 modrm = mv
+            emit_byte(modrm)
+            uint64 sv = (scale_bits << 6) | (idx_lo << 3) | base_lo
+            uint8 sib = sv
+            emit_byte(sib)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 138 {
+        // IR_MUL_IMM: dst = src1 * imm via three-operand `imul`.
+        // Encoding: REX.W + 6B /r ib    (imm fits in int8)   = 4 bytes
+        //           REX.W + 69 /r id    (imm fits in int32)  = 7 bytes
+        // Result sign-extends src1*imm into a full 64-bit register.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 dst = dst_r
+        if dst == 0xFFFFFFFF { dst = 0 }
+        uint8 rex = 0x48
+        if dst >= 8 { rex = rex | 4 }       // REX.R for dst (the reg field)
+        if a_reg >= 8 { rex = rex | 1 }     // REX.B for src1 (r/m)
+        emit_byte(rex)
+        uint64 use_imm8 = 0
+        if imm <= 127 { use_imm8 = 1 }
+        if imm >= 0xFFFFFFFFFFFFFF80 { use_imm8 = 1 }
+        if use_imm8 != 0 {
+            emit_byte(0x6B)
+        } else {
+            emit_byte(0x69)
+        }
+        uint64 mv = 0xC0 | ((dst & 7) << 3) | (a_reg & 7)
+        uint8 modrm = mv
+        emit_byte(modrm)
+        if use_imm8 != 0 {
+            uint8 d8 = imm
+            emit_byte(d8)
+        } else {
+            emit_u32_le(imm)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 137 {
+        // IR_ROR: dst = right-rotate(src1, src2 mod imm). imm is the
+        // rotation width (32 for `ROR r32, cl`; 64 reserved for future
+        // 64-bit rotations). The 32-bit form auto-zero-extends the
+        // upper 32 bits, making the result w32-clean — so a downstream
+        // `& 0xFFFFFFFF` mask gets elided by const-fold.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 b_reg = ir_resolve_src(s2_v, 1)
+        // ROR's count operand is fixed to CL (rcx low byte) in the
+        // variable-shift encoding. Move src2 there if needed.
+        if b_reg != 1 { ir_emit_mov_r64_r64(1, b_reg) }
+        uint64 dst = dst_r
+        if dst == 0xFFFFFFFF { dst = 0 }
+        // 32-bit MOV dst, a (no REX.W; auto-zero-extends to 64-bit).
+        if dst != a_reg {
+            uint64 need_rex = 0
+            if a_reg >= 8 { need_rex = 1 }
+            if dst >= 8 { need_rex = 1 }
+            if need_rex != 0 {
+                uint8 rex32 = 0x40
+                if a_reg >= 8 { rex32 = rex32 | 4 }
+                if dst >= 8 { rex32 = rex32 | 1 }
+                emit_byte(rex32)
+            }
+            emit_byte(0x89)
+            uint64 modrm_v = 0xC0 | ((a_reg & 7) << 3) | (dst & 7)
+            uint8 modrm = modrm_v
+            emit_byte(modrm)
+        }
+        // ROR r/m32, CL  =  D3 /1
+        if dst >= 8 { emit_byte(0x41) }    // REX.B for r8d-r15d
+        emit_byte(0xD3)
+        uint64 ror_modrm_v = 0xC8 | (dst & 7)
+        uint8 ror_modrm = ror_modrm_v
+        emit_byte(ror_modrm)
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
     if op == 4 {
         // IR_MUL: imul dst, src (commutative — swap if dst==src2)
         uint64 a_reg = ir_resolve_src(s1_v, 0)
@@ -6347,8 +6605,14 @@ fn ir_emit_x86_insn(uint64 ii) {
     if op >= 14 && op <= 19 {
         // IR_CMP_EQ through IR_CMP_GE: cmp + setcc + movzx
         uint64 a_reg = ir_resolve_src(s1_v, 0)
-        uint64 b_reg = ir_resolve_src(s2_v, 1)
-        ir_emit_cmp_r64_r64(a_reg, b_reg)
+        // src2 == 0 is the sentinel for cmp-imm mode (set by const-fold
+        // when src2 was a known constant fitting in signed 32-bit).
+        if s2_v == 0 {
+            ir_emit_cmp_r64_imm(a_reg, imm)
+        } else {
+            uint64 b_reg = ir_resolve_src(s2_v, 1)
+            ir_emit_cmp_r64_r64(a_reg, b_reg)
+        }
         // Fusion path: if this cmp feeds the BB's BR_COND terminator with a
         // single use, stash the jcc code and stop here. The terminator will
         // emit `0F <jcc> disp32` directly on the flags we just set.
@@ -6383,8 +6647,12 @@ fn ir_emit_x86_insn(uint64 ii) {
     // Signed comparisons (IR_SCMP_LT=120 through IR_SCMP_GE=123)
     if op >= 120 && op <= 123 {
         uint64 a_reg = ir_resolve_src(s1_v, 0)
-        uint64 b_reg = ir_resolve_src(s2_v, 1)
-        ir_emit_cmp_r64_r64(a_reg, b_reg)
+        if s2_v == 0 {
+            ir_emit_cmp_r64_imm(a_reg, imm)
+        } else {
+            uint64 b_reg = ir_resolve_src(s2_v, 1)
+            ir_emit_cmp_r64_r64(a_reg, b_reg)
+        }
         uint64 fuse_s = ir_cmp_fuse_code(ii)
         if fuse_s != 0 {
             ir_fused_jcc_code = fuse_s
@@ -9182,6 +9450,14 @@ static uint64 ir_opt_level = 1
 static uint64 ir_const_values = 0    // vreg -> constant value
 static uint64 ir_const_known = 0     // vreg -> 1 if constant is known
 
+// Per-vreg flag: is this vreg's value provably ≤ 0xFFFFFFFF (i.e., upper
+// 32 bits known zero)? Set conservatively forward through the IR by
+// ir_opt_const_fold based on the operation that produced the vreg.
+// Used to elide `& 0xFFFFFFFF` masks whose source is already 32-bit
+// clean — common in SHA-256 and similar 32-bit-style code that runs on
+// the 64-bit IR.
+static uint64 ir_w32_clean = 0
+
 fn ir_opt_const_fold() {
     uint64 ii = 0
     uint64 cur_bb = 0xFFFFFFFF
@@ -9211,6 +9487,12 @@ fn ir_opt_const_fold() {
                 uint64 k = ir_const_known + dest
                 uint8 one = 1
                 unsafe { *(k as uint8) = one }
+                // Constants with imm ≤ 0xFFFFFFFF are w32-clean.
+                if imm <= 0xFFFFFFFF {
+                    uint64 wp = ir_w32_clean + dest
+                    uint8 wone = 1
+                    unsafe { *(wp as uint8) = wone }
+                }
             }
             ii = ii + 1
             continue
@@ -9250,6 +9532,57 @@ fn ir_opt_const_fold() {
                 uint64 k = ir_const_known + dest
                 uint8 one = 1
                 unsafe { *(k as uint8) = one }
+            }
+            // w32-clean propagates through copy.
+            if dest > 0 && dest < 65536 && s1 > 0 && s1 < 65536 {
+                uint64 sp = ir_w32_clean + s1
+                uint8 sv = 0
+                unsafe { *(sp as uint8) -> sv }
+                if sv != 0 {
+                    uint64 dp = ir_w32_clean + dest
+                    uint8 one2 = 1
+                    unsafe { *(dp as uint8) = one2 }
+                }
+            }
+            ii = ii + 1
+            continue
+        }
+
+        // Read source w32-clean flags. A source is also "effectively
+        // w32-clean" if it's a known constant ≤ 0xFFFFFFFF.
+        uint64 s1_w32 = 0
+        uint64 s2_w32 = 0
+        if s1 > 0 && s1 < 65536 {
+            uint64 sp = ir_w32_clean + s1
+            uint8 sv = 0
+            unsafe { *(sp as uint8) -> sv }
+            s1_w32 = sv
+        }
+        if s1_known != 0 && v1 <= 0xFFFFFFFF { s1_w32 = 1 }
+        if s2 > 0 && s2 < 65536 {
+            uint64 sp = ir_w32_clean + s2
+            uint8 sv = 0
+            unsafe { *(sp as uint8) -> sv }
+            s2_w32 = sv
+        }
+        if s2_known != 0 && v2 <= 0xFFFFFFFF { s2_w32 = 1 }
+
+        // Mask elimination: AND(x, 0xFFFFFFFF) where x is w32-clean is a
+        // no-op — replace with COPY. Each per-iteration AND in sha-256
+        // is 7 bytes (REX.W + 0x21 + ModRM, or REX.W + 0x81 /4 imm32),
+        // so eliminating one per round across millions of rounds is
+        // measurable. The mask must be exactly 0xFFFFFFFF (or wider but
+        // with all-ones in the low 32 bits — only 0xFFFFFFFF appears in
+        // practice, so be conservative).
+        if op == 7 && s2_known != 0 && v2 == 0xFFFFFFFF && s1_w32 != 0 {
+            ir_insn_set_opcode(ii, 61)        // → IR_COPY
+            ir_insn_set_src2(ii, 0)
+            ir_insn_set_imm(ii, 0)
+            // Result is w32-clean (it's a copy of a w32-clean source).
+            if dest > 0 && dest < 65536 {
+                uint64 dp = ir_w32_clean + dest
+                uint8 one3 = 1
+                unsafe { *(dp as uint8) = one3 }
             }
             ii = ii + 1
             continue
@@ -9336,6 +9669,73 @@ fn ir_opt_const_fold() {
             }
             ii = ii + 1
             continue
+        }
+
+        // CMP/SCMP with constant src2 → encode the immediate in the
+        // insn's imm field and zero src2 (sentinel for imm-mode at
+        // codegen). x86-only: ARM64 codegen still expects src2 to be a
+        // vreg. x86 has `cmp r/m64, imm8` (4 bytes) and
+        // `cmp r/m64, imm32` (7 bytes), both shorter than the current
+        // `mov r12d, imm; cmp rbx, r12` (6 + 3 = 9 bytes). For imm == 0
+        // the codegen swaps to the even shorter `test r, r` (3 bytes).
+        if target_arch == 0 && ((op >= 14 && op <= 19) || (op >= 120 && op <= 123)) {
+            if s2_known != 0 {
+                uint64 fits = 0
+                if v2 <= 0x7FFFFFFF { fits = 1 }
+                if v2 >= 0xFFFFFFFF80000000 { fits = 1 }
+                if fits != 0 {
+                    ir_insn_set_src2(ii, 0)
+                    ir_insn_set_imm(ii, v2)
+                    // Don't `continue` — fall through so dest's w32-clean
+                    // and other propagation still happens.
+                }
+            }
+        }
+
+        // IMUL-by-immediate fusion: `t = a * c` where c is a known
+        // constant fitting in signed 32-bit → IR_MUL_IMM. x86's
+        // three-operand `imul r64, r/m64, imm32` doesn't need the
+        // constant in a register, eliminating one IR_CONST + a likely
+        // spill round-trip per scaled-address computation. The matmul
+        // inner loop alone has 4+ such scalings per iteration. Skip
+        // c == 0 (already turned into CONST 0 by the zero-rule
+        // earlier) and c == 1 (turned into COPY).
+        if target_arch == 0 && op == 4 && s2_known != 0 && v2 != 0 && v2 != 1 {
+            uint64 fits = 0
+            if v2 <= 0x7FFFFFFF { fits = 1 }
+            if v2 >= 0xFFFFFFFF80000000 { fits = 1 }
+            if fits != 0 {
+                ir_insn_set_opcode(ii, 138)   // IR_MUL_IMM
+                ir_insn_set_src2(ii, 0)
+                ir_insn_set_imm(ii, v2)
+                ii = ii + 1
+                continue
+            }
+        }
+
+        // LEA fusion: ADD/SUB with a constant src2 → IR_ADD_IMM/IR_SUB_IMM.
+        // x86-only — ARM64 already lowers small-imm arithmetic efficiently
+        // via emit_a64_add (reg-reg) after the IR_CONST loads into a reg,
+        // and `add Xd, Xn, #imm` doesn't shorten the same way LEA does on
+        // x86. The constant must fit in signed 32-bit because LEA's
+        // displacement is sign-extended from 32 bits. v2 is uint64; check
+        // both representations (positive ≤ 0x7FFFFFFF or negative ≥
+        // 0xFFFFFFFF80000000). Skip v2==0 since `x ± 0` should be a copy,
+        // and our LEA emitter assumes disp != 0 (to avoid the
+        // RIP-relative encoding collision when src is rbp/r13).
+        if target_arch == 0 && (op == 2 || op == 3) && s2_known != 0 && v2 != 0 {
+            uint64 fits = 0
+            if v2 <= 0x7FFFFFFF { fits = 1 }
+            if v2 >= 0xFFFFFFFF80000000 { fits = 1 }
+            if fits != 0 {
+                uint64 new_op = 135      // IR_ADD_IMM
+                if op == 3 { new_op = 136 }  // IR_SUB_IMM
+                ir_insn_set_opcode(ii, new_op)
+                ir_insn_set_src2(ii, 0)
+                ir_insn_set_imm(ii, v2)
+                ii = ii + 1
+                continue
+            }
         }
 
         // Fold unary NEG (op 12)
@@ -9460,6 +9860,41 @@ fn ir_opt_const_fold() {
             }
         }
 
+        // Propagate w32-clean to dest based on the surviving op. Only
+        // operations that provably keep the result ≤ 0xFFFFFFFF mark
+        // their dest. Conservative defaults (ADD/SUB/MUL/SHL) leave the
+        // dest as not-clean since carry/overflow can spill.
+        if dest > 0 && dest < 65536 {
+            uint64 mark = 0
+            // AND: result ≤ min(s1, s2). Either side being w32-clean
+            // clamps the result to fit in 32 bits.
+            if op == 7 && (s1_w32 != 0 || s2_w32 != 0) { mark = 1 }
+            // OR/XOR: result has bits only where either operand has bits.
+            // Both must be w32-clean.
+            if (op == 8 || op == 9) && s1_w32 != 0 && s2_w32 != 0 { mark = 1 }
+            // Logical right shift: zero-fills the top, so SHR of a
+            // w32-clean source stays w32-clean. Also, SHR by ≥ 32 of
+            // any 64-bit value fits in 32 bits.
+            if op == 11 {
+                if s1_w32 != 0 { mark = 1 }
+                if s2_known != 0 && v2 >= 32 { mark = 1 }
+            }
+            // 1/2/4-byte LOAD zero-extends. imm carries the load width
+            // for simple loads (struct-field loads put the size in src2
+            // and leave imm=0, which we conservatively skip).
+            if op == 30 {
+                if imm == 1 || imm == 2 || imm == 4 { mark = 1 }
+            }
+            // IR_ROR with width=32 emits a 32-bit ROR which auto-zeros
+            // the upper 32 bits.
+            if op == 137 && imm == 32 { mark = 1 }
+            if mark != 0 {
+                uint64 dp = ir_w32_clean + dest
+                uint8 one4 = 1
+                unsafe { *(dp as uint8) = one4 }
+            }
+        }
+
         ii = ii + 1
     }
 }
@@ -9553,8 +9988,10 @@ fn ir_opt_dce() {
 
             if keep != 0 {
                 ir_opt_dce_mark(s1, changed_ptr)
-                // src2 is a vreg for all ops EXCEPT the ones below
-                if op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 {
+                // src2 is a vreg for all ops EXCEPT the ones below.
+                // Add IR_ADD_IMM(135) / IR_SUB_IMM(136) — they encode the
+                // displacement in imm and don't use src2.
+                if op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 && op != 135 && op != 136 && op != 138 {
                     ir_opt_dce_mark(s2, changed_ptr)
                 }
                 // imm-as-vreg for MEMCPY, MEMSET, RET3, ATOMIC_CAS, FFMA
@@ -9874,8 +10311,10 @@ fn ir_licm_build_def_bb_map() {
 
 // Returns 1 iff vreg's defining BB is outside [body_first .. body_last]
 // inclusive, or vreg is undefined (treated as "external constant").
-// Multi-def vregs are conservatively NOT invariant — at least one of
-// their defs may be inside the loop region.
+// Multi-def vregs are conservatively NOT invariant. The agent-flagged
+// matmul case (back-edge COPY in outer loop wrongly blocks hoisting
+// from inner loop) is left for a future bitmap pass — preliminary
+// per-loop bitmap implementation hung the bootstrap on krc itself.
 fn ir_licm_is_invariant_vreg(uint64 vreg, uint64 body_first, uint64 body_last) -> uint64 {
     if vreg == 0 { return 1 }
     if vreg >= ir_def_bb_cap { return 0 }
@@ -9883,8 +10322,8 @@ fn ir_licm_is_invariant_vreg(uint64 vreg, uint64 body_first, uint64 body_last) -
     uint32 b = 0
     unsafe { *(p as uint32) -> b }
     uint64 wb = b
-    if wb == 0xFFFFFFFF { return 1 }   // external / param
-    if wb == 0xFFFFFFFE { return 0 }   // multi-def — treat as varying
+    if wb == 0xFFFFFFFF { return 1 }
+    if wb == 0xFFFFFFFE { return 0 }
     if wb >= body_first && wb <= body_last { return 0 }
     return 1
 }
@@ -9998,7 +10437,9 @@ fn ir_opt_licm() {
 fn ir_optimize() {
     if ir_const_values == 0 { ir_const_values = alloc(65536 * 8) }
     if ir_const_known == 0 { ir_const_known = alloc(65536) }
+    if ir_w32_clean == 0 { ir_w32_clean = alloc(65536) }
     memset(ir_const_known, 0, 65536)
+    memset(ir_w32_clean, 0, 65536)
     ir_opt_const_fold()
     ir_opt_dce()
     ir_opt_cse()
@@ -10016,6 +10457,285 @@ fn ir_optimize() {
     //
     ir_opt_licm()
     ir_opt_dce()
+    // ROR pattern recognition: collapse the canonical 32-bit rotation
+    // idiom (`OR(AND(SHR(x,n), 0xFFFFFFFF), AND(SHL(x, 32-n), 0xFFFFFFFF))`)
+    // into a single IR_ROR. After this pass, the inner ANDs / SHL / SHR /
+    // CONST(0xFFFFFFFF) feed nothing live and DCE can clean them up. A
+    // second const-fold pass sees the new IR_ROR (which is w32-clean) and
+    // elides any consumer `& 0xFFFFFFFF` that the first pass left in.
+    ir_opt_recognize_rotate()
+    ir_opt_const_fold()
+    ir_opt_dce()
+    // LEA-base-index-scale: collapse `add(base, mul_imm(idx, K))` for
+    // K ∈ {1,2,4,8} into a single x86 LEA. Runs after const-fold has
+    // produced IR_MUL_IMM. Cleans up array-indexing patterns that
+    // matmul/sort beat the IR allocator with.
+    ir_opt_recognize_lea_bis()
+    ir_opt_dce()
+    // FMA pattern recognition: collapse `FADD(FMUL(a,b), c)` into a
+    // single IR_FFMA. The current FFMA emit isn't actually a hardware
+    // FMA instruction — it just inlines mulsd+addsd back-to-back —
+    // but skipping the GPR round-trip between the FMUL and FADD saves
+    // 4 mov instructions per fused pair, which adds up in
+    // mandelbrot's `two * x * y + y0` and similar.
+    ir_compute_use_count()
+    ir_opt_recognize_ffma()
+    ir_opt_dce()
+}
+
+// ---------------------------------------------------------------------------
+// FMA pattern recognition: FADD(FMUL(a,b), c) → FFMA(a, b, c).
+// Requires the FMUL's dest to have exactly one use (this FADD).
+// ---------------------------------------------------------------------------
+
+fn ir_opt_recognize_ffma() {
+    ir_build_def_idx()
+    uint64 ii = 0
+    while ii < ir_insn_count {
+        uint64 op = ir_insn_opcode(ii)
+        if op != 20 { ii = ii + 1; continue }     // not FADD
+        uint64 dest = ir_insn_dest(ii)
+        uint64 s1 = ir_insn_src1(ii)
+        uint64 s2 = ir_insn_src2(ii)
+
+        // Try src1's def as FMUL.
+        uint64 a_v = 0
+        uint64 b_v = 0
+        uint64 c_v = 0
+        uint64 mul_idx = 0xFFFFFFFF
+        uint64 d1 = ir_def_idx(s1)
+        if d1 != 0xFFFFFFFF && ir_insn_opcode(d1) == 22 && ir_use_count_get(s1) == 1 {
+            a_v = ir_insn_src1(d1)
+            b_v = ir_insn_src2(d1)
+            c_v = s2
+            mul_idx = d1
+        } else {
+            // Try src2's def as FMUL (commutative).
+            uint64 d2 = ir_def_idx(s2)
+            if d2 != 0xFFFFFFFF && ir_insn_opcode(d2) == 22 && ir_use_count_get(s2) == 1 {
+                a_v = ir_insn_src1(d2)
+                b_v = ir_insn_src2(d2)
+                c_v = s1
+                mul_idx = d2
+            }
+        }
+        if mul_idx != 0xFFFFFFFF {
+            ir_insn_set_opcode(ii, 98)            // IR_FFMA
+            ir_insn_set_src1(ii, a_v)
+            ir_insn_set_src2(ii, b_v)
+            ir_insn_set_imm(ii, c_v)
+            // Mark the FMUL as dead — DCE will remove it.
+            ir_insn_set_opcode(mul_idx, 0)
+        }
+        ii = ii + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LEA[base + index * scale] pattern recognition.
+// ---------------------------------------------------------------------------
+
+fn ir_opt_recognize_lea_bis() {
+    ir_build_def_idx()
+    uint64 ii = 0
+    while ii < ir_insn_count {
+        uint64 op = ir_insn_opcode(ii)
+        if op != 2 { ii = ii + 1; continue }      // not ADD
+        uint64 s1 = ir_insn_src1(ii)
+        uint64 s2 = ir_insn_src2(ii)
+
+        // Try src2's def as MUL_IMM with scale ∈ {1,2,4,8}.
+        uint64 base_v = 0
+        uint64 idx_v = 0
+        uint64 scale = 0
+        uint64 d2 = ir_def_idx(s2)
+        if d2 != 0xFFFFFFFF && ir_insn_opcode(d2) == 138 {
+            uint64 m_imm = ir_insn_imm(d2)
+            if m_imm == 1 || m_imm == 2 || m_imm == 4 || m_imm == 8 {
+                base_v = s1
+                idx_v = ir_insn_src1(d2)
+                scale = m_imm
+            }
+        }
+        // Try src1 if src2 didn't match (commutative).
+        if scale == 0 {
+            uint64 d1 = ir_def_idx(s1)
+            if d1 != 0xFFFFFFFF && ir_insn_opcode(d1) == 138 {
+                uint64 m_imm = ir_insn_imm(d1)
+                if m_imm == 1 || m_imm == 2 || m_imm == 4 || m_imm == 8 {
+                    base_v = s2
+                    idx_v = ir_insn_src1(d1)
+                    scale = m_imm
+                }
+            }
+        }
+        if scale != 0 {
+            ir_insn_set_opcode(ii, 139)        // IR_LEA_BIS
+            ir_insn_set_src1(ii, base_v)
+            ir_insn_set_src2(ii, idx_v)
+            ir_insn_set_imm(ii, scale)
+        }
+        ii = ii + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vreg-defining-instruction map. Built linearly by ir_build_def_idx so the
+// rotate-pattern matcher can walk back from a use to its definition. Map
+// is invalidated after any IR rewrite that changes def sites — callers
+// should rebuild before each use, or at least not assume staleness is OK.
+// ---------------------------------------------------------------------------
+
+static uint64 ir_def_idx_buf = 0
+static uint64 ir_def_idx_cap = 0
+
+fn ir_build_def_idx() {
+    if ir_def_idx_buf == 0 {
+        ir_def_idx_cap = 65536
+        ir_def_idx_buf = alloc(ir_def_idx_cap * 4)
+    }
+    // 0xFFFFFFFF sentinel = no def found.
+    uint64 i = 0
+    while i < ir_def_idx_cap {
+        uint64 p = ir_def_idx_buf + i * 4
+        uint32 fff = 0xFFFFFFFF
+        unsafe { *(p as uint32) = fff }
+        i = i + 1
+    }
+    uint64 ii = 0
+    while ii < ir_insn_count {
+        uint64 op = ir_insn_opcode(ii)
+        if op != 0 {
+            uint64 dest = ir_insn_dest(ii)
+            if dest > 0 && dest < ir_def_idx_cap {
+                uint64 p = ir_def_idx_buf + dest * 4
+                uint32 ii32 = ii
+                unsafe { *(p as uint32) = ii32 }
+            }
+        }
+        ii = ii + 1
+    }
+}
+
+// Returns the index of the instruction defining `vreg`, or 0xFFFFFFFF if
+// none was recorded.
+fn ir_def_idx(uint64 vreg) -> uint64 {
+    if vreg == 0 || vreg >= ir_def_idx_cap { return 0xFFFFFFFF }
+    uint64 p = ir_def_idx_buf + vreg * 4
+    uint32 v = 0
+    unsafe { *(p as uint32) -> v }
+    if v == 0xFFFFFFFF { return 0xFFFFFFFF }
+    return v
+}
+
+// Walks COPY chains from `vreg` and returns the index of the first
+// non-COPY defining instruction. Returns 0xFFFFFFFF if not found.
+fn ir_def_skip_copy(uint64 vreg) -> uint64 {
+    uint64 cur = vreg
+    uint64 guard = 0
+    while guard < 64 {
+        uint64 d = ir_def_idx(cur)
+        if d == 0xFFFFFFFF { return 0xFFFFFFFF }
+        uint64 op = ir_insn_opcode(d)
+        if op != 61 { return d }
+        cur = ir_insn_src1(d)
+        if cur == 0 { return 0xFFFFFFFF }
+        guard = guard + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// ROR pattern matcher. Called once per ir_optimize invocation, after
+// LICM + DCE so the IR is in canonical SSA form. For each OR
+// instruction whose operands trace through copies to AND-with-0xFFFFFFFF
+// of SHR/SHL of the same source vreg with complementary shift amounts
+// (n and 32-n), rewrite the OR to an IR_ROR and let DCE drop the dead
+// SHR/SHL/AND chain.
+fn ir_opt_recognize_rotate() {
+    ir_build_def_idx()
+    uint64 ii = 0
+    while ii < ir_insn_count {
+        uint64 op = ir_insn_opcode(ii)
+        if op != 8 { ii = ii + 1; continue }      // not OR
+        uint64 or_s1 = ir_insn_src1(ii)
+        uint64 or_s2 = ir_insn_src2(ii)
+        uint64 d1 = ir_def_skip_copy(or_s1)
+        uint64 d2 = ir_def_skip_copy(or_s2)
+        if d1 == 0xFFFFFFFF || d2 == 0xFFFFFFFF { ii = ii + 1; continue }
+        // Both must be AND.
+        if ir_insn_opcode(d1) != 7 { ii = ii + 1; continue }
+        if ir_insn_opcode(d2) != 7 { ii = ii + 1; continue }
+        // Each AND's src2 must be (after copy-skipping) a CONST whose
+        // imm equals 0xFFFFFFFF. CSE folds the three 0xFFFFFFFF
+        // constants in the rotr32 idiom into a single canonical CONST
+        // and rewrites the inner ANDs' src2 to COPY-of-canonical, so we
+        // need to skip COPYs to find the underlying CONST.
+        uint64 m1_def = ir_def_skip_copy(ir_insn_src2(d1))
+        uint64 m2_def = ir_def_skip_copy(ir_insn_src2(d2))
+        if m1_def == 0xFFFFFFFF || m2_def == 0xFFFFFFFF { ii = ii + 1; continue }
+        if ir_insn_opcode(m1_def) != 1 { ii = ii + 1; continue }
+        if ir_insn_opcode(m2_def) != 1 { ii = ii + 1; continue }
+        if ir_insn_imm(m1_def) != 0xFFFFFFFF { ii = ii + 1; continue }
+        if ir_insn_imm(m2_def) != 0xFFFFFFFF { ii = ii + 1; continue }
+        // Each AND's src1 must trace to an SHR (one) and an SHL (the other).
+        uint64 sh1_def = ir_def_skip_copy(ir_insn_src1(d1))
+        uint64 sh2_def = ir_def_skip_copy(ir_insn_src1(d2))
+        if sh1_def == 0xFFFFFFFF || sh2_def == 0xFFFFFFFF { ii = ii + 1; continue }
+        uint64 sh1_op = ir_insn_opcode(sh1_def)
+        uint64 sh2_op = ir_insn_opcode(sh2_def)
+        uint64 shr_def = 0xFFFFFFFF
+        uint64 shl_def = 0xFFFFFFFF
+        if sh1_op == 11 && sh2_op == 10 {
+            shr_def = sh1_def
+            shl_def = sh2_def
+        } else {
+            if sh1_op == 10 && sh2_op == 11 {
+                shr_def = sh2_def
+                shl_def = sh1_def
+            } else {
+                ii = ii + 1
+                continue
+            }
+        }
+        // Same x vreg in both shifts.
+        uint64 x = ir_insn_src1(shr_def)
+        if ir_insn_src1(shl_def) != x { ii = ii + 1; continue }
+        uint64 n = ir_insn_src2(shr_def)
+        uint64 m = ir_insn_src2(shl_def)
+        // Two acceptable shapes for the SHL amount `m`:
+        //   (a) m is defined as `SUB(const_32, n)` — the variable form
+        //       inside rotr32 itself, where n is the rotation amount param.
+        //   (b) m and n are both constants and `m + n == 32` — the
+        //       inlined / constant-folded form, e.g., `rotr32(w15, 7)`
+        //       expanded inline becomes shr(w15, 7) and shl(w15, 25).
+        uint64 ok = 0
+        uint64 m_def = ir_def_skip_copy(m)
+        if m_def != 0xFFFFFFFF {
+            if ir_insn_opcode(m_def) == 3 && ir_insn_src2(m_def) == n {
+                uint64 wc_def = ir_def_skip_copy(ir_insn_src1(m_def))
+                if wc_def != 0xFFFFFFFF && ir_insn_opcode(wc_def) == 1 && ir_insn_imm(wc_def) == 32 {
+                    ok = 1
+                }
+            }
+            if ok == 0 && ir_insn_opcode(m_def) == 1 {
+                uint64 n_def = ir_def_skip_copy(n)
+                if n_def != 0xFFFFFFFF && ir_insn_opcode(n_def) == 1 {
+                    if ir_insn_imm(m_def) + ir_insn_imm(n_def) == 32 {
+                        ok = 1
+                    }
+                }
+            }
+        }
+        if ok == 0 { ii = ii + 1; continue }
+        // All conditions satisfied. Rewrite the OR in place to IR_ROR.
+        // The intermediate AND/SHR/SHL/SUB/CONST chain becomes dead and
+        // the trailing DCE pass removes it.
+        ir_insn_set_opcode(ii, 137)
+        ir_insn_set_src1(ii, x)
+        ir_insn_set_src2(ii, n)
+        ir_insn_set_imm(ii, 32)
+        ii = ii + 1
+    }
 }
 
 @export

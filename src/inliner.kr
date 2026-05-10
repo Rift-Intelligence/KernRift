@@ -24,12 +24,95 @@ static uint64 inline_table_buf = 0      // [name_tok(u32), body_expr_idx(u32)] x
 static uint64 inline_table_count = 0
 static uint64 inline_current_fn_tok = 0 // for recursion check
 
+// Per-call body-locals table for the rotation-shape inliner. Populated
+// by inline_try_call from the callee's VarDecl prefix before
+// clone-subst expands the Return expression. Each entry stores
+// (name_tok, init_expr_idx) so an Ident in the Return that names a
+// body-local gets recursively expanded (with param substitution
+// applied) instead of treated as a free variable.
+static uint64 INLINE_LOCALS_CAP = 8
+static uint64 inline_locals_buf = 0
+static uint64 inline_locals_count = 0
+
+// Parallel flag table: 1 bit per inline_table entry. Bit 0 set means
+// "rotation shape — require trivial args (Ident or literal) at the
+// call site to avoid duplicating side-effecting arguments." Stored
+// alongside inline_table for cache locality.
+static uint64 inline_flags_buf = 0
+
 @export
 fn inline_init() {
     if inline_table_buf == 0 {
         inline_table_buf = alloc(INLINE_TABLE_CAP * 8)
     }
+    if inline_flags_buf == 0 {
+        inline_flags_buf = alloc(INLINE_TABLE_CAP)
+    }
+    if inline_locals_buf == 0 {
+        inline_locals_buf = alloc(INLINE_LOCALS_CAP * 8)
+    }
     inline_table_count = 0
+    inline_locals_count = 0
+    memset(inline_flags_buf, 0, INLINE_TABLE_CAP)
+}
+
+fn inline_local_register(uint64 name_tok, uint64 init_expr) {
+    if inline_locals_count >= INLINE_LOCALS_CAP { return }
+    uint64 entry = inline_locals_buf + inline_locals_count * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 ie = init_expr
+    unsafe { *(e4 as uint32) = ie }
+    inline_locals_count = inline_locals_count + 1
+}
+
+fn inline_local_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < inline_locals_count {
+        uint64 entry = inline_locals_buf + i * 8
+        uint32 nt = 0
+        unsafe { *(entry as uint32) -> nt }
+        uint64 wnt = nt
+        if tok_text_eq(wnt, name_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 ie = 0
+            unsafe { *(e4 as uint32) -> ie }
+            return ie
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn inline_flag_set(uint64 idx, uint64 v) {
+    if idx >= INLINE_TABLE_CAP { return }
+    uint64 p = inline_flags_buf + idx
+    uint8 b = v
+    unsafe { *(p as uint8) = b }
+}
+
+fn inline_flag_get(uint64 idx) -> uint64 {
+    if idx >= INLINE_TABLE_CAP { return 0 }
+    uint64 p = inline_flags_buf + idx
+    uint64 b = 0
+    unsafe { *(p as uint8) -> b }
+    return b
+}
+
+// True iff `expr` is trivially duplicable — substituting it K times
+// has the same cost as evaluating it once. Allowed: Ident, IntLit,
+// FloatLitNode, SizeofLit. Used to gate rotation-shape inlining where
+// params show up multiple times in the inlined body.
+fn inline_arg_is_trivial(uint64 expr) -> uint64 {
+    if expr == 0 { return 0 }
+    uint32 k = ast_kind(expr)
+    uint64 wk = k
+    if wk == 30 { return 1 }   // IntLit
+    if wk == 32 { return 1 }   // Ident
+    if wk == 46 { return 1 }   // FloatLitNode
+    if wk == 49 { return 1 }   // SizeofLit
+    return 0
 }
 
 // True if `kind` is one of the allowed pure-expression kinds.
@@ -129,8 +212,124 @@ fn inline_params_single_use(uint64 fn_node, uint64 body_expr) -> uint64 {
     return 1
 }
 
+// True iff `fn_node` matches the canonical 32-bit-rotation idiom
+// (rotr32-shape). Returns 1 on match. Detecting this at AST time lets
+// us relax the param-multi-use rule that normally blocks inlining of
+// such bodies — rotation params are referenced 2x by definition. After
+// inlining, the IR-level ROR pattern matcher collapses the body to a
+// single ROR instruction, so the duplication has no register-pressure
+// cost.
+//
+// The shape we accept (32-bit only — sha-256 / sha-1 / md5 all match):
+//   {
+//     T lo = (x >> n) & 0xFFFFFFFF
+//     T hi = (x << (32 - n)) & 0xFFFFFFFF
+//     return (lo | hi) & 0xFFFFFFFF
+//   }
+fn inline_is_rotation_shape(uint64 body, uint64 fn_node) -> uint64 {
+    if body == 0 { return 0 }
+    if ast_kind(body) != 15 { return 0 }
+    // Need exactly 2 params.
+    uint32 p1 = ast_child(fn_node)
+    if p1 == 0 || ast_kind(p1) != 3 { return 0 }
+    uint32 p2 = ast_next(p1)
+    if p2 == 0 || ast_kind(p2) != 3 { return 0 }
+    if ast_next(p2) != 0 { return 0 }
+    uint32 x_tok = ast_data2(p1)
+    uint32 n_tok = ast_data2(p2)
+    // Three statements: VarDecl, VarDecl, Return.
+    uint32 vd1 = ast_child(body)
+    if vd1 == 0 || ast_kind(vd1) != 10 { return 0 }
+    uint32 vd2 = ast_next(vd1)
+    if vd2 == 0 || ast_kind(vd2) != 10 { return 0 }
+    uint32 ret = ast_next(vd2)
+    if ret == 0 || ast_kind(ret) != 12 { return 0 }
+    if ast_next(ret) != 0 { return 0 }
+    uint32 lo_tok = ast_data2(vd1)
+    uint32 hi_tok = ast_data2(vd2)
+    // VarDecl init = AND(SHR(x, n), 0xFFFFFFFF)
+    uint32 init1 = ast_child(vd1)
+    if init1 == 0 || ast_kind(init1) != 33 { write(2, "[rot] init1 not BinOp\n", 22); return 0 }
+    uint64 op1_kind = tok_kind_at_raw(ast_data1(init1))
+    if op1_kind != 23 { return 0 }
+    uint32 lhs1 = ast_child(init1)
+    uint32 rhs1 = ast_data2(init1)
+    if rhs1 == 0 || ast_kind(rhs1) != 30 { return 0 }   // not IntLit
+    // IntLit's data1 is the TOKEN INDEX of the literal text — parse it
+    // to get the value.
+    uint64 rhs1_tok = ast_data1(rhs1)
+    if parse_int_token(rhs1_tok) != 0xFFFFFFFF { return 0 }
+    if lhs1 == 0 || ast_kind(lhs1) != 33 { return 0 }   // not BinOp
+    uint64 shr_kind = tok_kind_at_raw(ast_data1(lhs1))
+    if shr_kind != 44 { return 0 }    // not >>
+    uint32 shr_lhs = ast_child(lhs1)
+    uint32 shr_rhs = ast_data2(lhs1)
+    uint64 wxt = x_tok
+    uint64 wnt = n_tok
+    if shr_lhs == 0 || ast_kind(shr_lhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(shr_lhs), wxt) == 0 { return 0 }
+    if shr_rhs == 0 || ast_kind(shr_rhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(shr_rhs), wnt) == 0 { return 0 }
+    // VarDecl 2 init = AND(SHL(x, SUB(32, n)), 0xFFFFFFFF)
+    uint32 init2 = ast_child(vd2)
+    if init2 == 0 || ast_kind(init2) != 33 { return 0 }
+    uint64 op2_kind = tok_kind_at_raw(ast_data1(init2))
+    if op2_kind != 23 { return 0 }
+    uint32 lhs2 = ast_child(init2)
+    uint32 rhs2 = ast_data2(init2)
+    if rhs2 == 0 || ast_kind(rhs2) != 30 { return 0 }
+    uint64 rhs2_tok = ast_data1(rhs2)
+    if parse_int_token(rhs2_tok) != 0xFFFFFFFF { return 0 }
+    if lhs2 == 0 || ast_kind(lhs2) != 33 { return 0 }
+    uint64 shl_kind = tok_kind_at_raw(ast_data1(lhs2))
+    if shl_kind != 43 { return 0 }    // not <<
+    uint32 shl_lhs = ast_child(lhs2)
+    uint32 shl_rhs = ast_data2(lhs2)
+    if shl_lhs == 0 || ast_kind(shl_lhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(shl_lhs), wxt) == 0 { return 0 }
+    if shl_rhs == 0 || ast_kind(shl_rhs) != 33 { return 0 }
+    uint64 sub_kind = tok_kind_at_raw(ast_data1(shl_rhs))
+    if sub_kind != 31 { return 0 }    // not -
+    uint32 sub_lhs = ast_child(shl_rhs)
+    uint32 sub_rhs = ast_data2(shl_rhs)
+    if sub_lhs == 0 || ast_kind(sub_lhs) != 30 { return 0 }
+    uint64 sub_lhs_tok = ast_data1(sub_lhs)
+    if parse_int_token(sub_lhs_tok) != 32 { return 0 }
+    if sub_rhs == 0 || ast_kind(sub_rhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(sub_rhs), wnt) == 0 { return 0 }
+    // Return expr = AND(OR(lo, hi), 0xFFFFFFFF)
+    uint32 ret_expr = ast_child(ret)
+    if ret_expr == 0 || ast_kind(ret_expr) != 33 { return 0 }
+    uint64 ret_op = tok_kind_at_raw(ast_data1(ret_expr))
+    if ret_op != 23 { return 0 }      // not &
+    uint32 ret_lhs = ast_child(ret_expr)
+    uint32 ret_rhs = ast_data2(ret_expr)
+    if ret_rhs == 0 || ast_kind(ret_rhs) != 30 { return 0 }
+    uint64 ret_rhs_tok = ast_data1(ret_rhs)
+    if parse_int_token(ret_rhs_tok) != 0xFFFFFFFF { return 0 }
+    if ret_lhs == 0 || ast_kind(ret_lhs) != 33 { return 0 }
+    uint64 or_op = tok_kind_at_raw(ast_data1(ret_lhs))
+    if or_op != 24 { return 0 }       // not |
+    uint32 or_lhs = ast_child(ret_lhs)
+    uint32 or_rhs = ast_data2(ret_lhs)
+    uint64 wlt = lo_tok
+    uint64 wht = hi_tok
+    if or_lhs == 0 || ast_kind(or_lhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(or_lhs), wlt) == 0 { return 0 }
+    if or_rhs == 0 || ast_kind(or_rhs) != 32 { return 0 }
+    if tok_text_eq(ast_data1(or_rhs), wht) == 0 { return 0 }
+    return 1
+}
+
 // Returns the body Return-value expression if `fn_node` is eligible,
-// else 0.
+// else 0. Two acceptable shapes:
+//   (a) Single Return statement with a pure expression and per-param
+//       single-use (the original conservative case).
+//   (b) The 32-bit rotation idiom — three statements (VarDecl lo,
+//       VarDecl hi, Return) matching `inline_is_rotation_shape`. The
+//       multi-use param check is relaxed for this shape because the
+//       IR-level ROR matcher collapses the inlined body to a single
+//       instruction, so the duplication carries zero runtime cost.
 fn inline_body_expr(uint64 fn_node) -> uint64 {
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 0 }
@@ -138,19 +337,27 @@ fn inline_body_expr(uint64 fn_node) -> uint64 {
 
     uint32 stmt = ast_child(body)
     if stmt == 0 { return 0 }
-    // Must be the only statement.
-    if ast_next(stmt) != 0 { return 0 }
-    if ast_kind(stmt) != 12 { return 0 }   // not a Return
-
-    uint32 expr = ast_child(stmt)
-    if expr == 0 { return 0 }              // void return — nothing to inline
-    // Tuple returns put extras in data3/data4 — skip those.
-    if ast_data3(stmt) != 0 { return 0 }
-    if ast_data4(stmt) != 0 { return 0 }
-
-    if inline_expr_is_pure(expr) == 0 { return 0 }
-    if inline_params_single_use(fn_node, expr) == 0 { return 0 }
-    return expr
+    // Path (a): single-statement Return.
+    if ast_next(stmt) == 0 && ast_kind(stmt) == 12 {
+        uint32 expr = ast_child(stmt)
+        if expr == 0 { return 0 }
+        if ast_data3(stmt) != 0 { return 0 }
+        if ast_data4(stmt) != 0 { return 0 }
+        if inline_expr_is_pure(expr) == 0 { return 0 }
+        if inline_params_single_use(fn_node, expr) == 0 { return 0 }
+        return expr
+    }
+    // Path (b): rotation idiom. Return the AST node of the Return's expr
+    // for the substitution machinery to clone. inline_try_call's body
+    // walker handles VarDecl-prefix substitution.
+    if inline_is_rotation_shape(body, fn_node) != 0 {
+        // Walk to the third statement (the Return) and return its expr.
+        uint32 vd1 = ast_child(body)
+        uint32 vd2 = ast_next(vd1)
+        uint32 ret = ast_next(vd2)
+        return ast_child(ret)
+    }
+    return 0
 }
 
 // Walk Module's FnDecls and register every eligible candidate.
@@ -184,6 +391,13 @@ fn inline_collect(uint64 root) {
                         uint64 slot4 = slot + 4
                         uint32 be32 = body_expr
                         unsafe { *(slot4 as uint32) = be32 }
+                        // Flag rotation-shape candidates so inline_try_call
+                        // can populate the body-locals table and require
+                        // trivial args.
+                        uint32 fn_body = ast_data3(fn_n)
+                        uint64 wfb = fn_body
+                        uint64 is_rot = inline_is_rotation_shape(wfb, fn_n)
+                        inline_flag_set(inline_table_count, is_rot)
                         inline_table_count = inline_table_count + 1
                     }
                 }
@@ -295,7 +509,7 @@ fn inline_clone_subst(uint64 expr, uint64 fn_node, uint64 args_first) -> uint64 
     uint64 wk = k
 
     if wk == 32 {
-        // Ident: maybe a parameter.
+        // Ident: maybe a parameter, maybe a body-local, else free var.
         uint32 nt = ast_data1(expr)
         uint64 wnt = nt
         uint64 pidx = inline_param_index(fn_node, wnt)
@@ -313,7 +527,19 @@ fn inline_clone_subst(uint64 expr, uint64 fn_node, uint64 args_first) -> uint64 
             }
             return c
         }
-        // Not a param — copy as-is (no children).
+        // Body-local (rotation-shape inliner only): recursively
+        // clone-subst its init expression so its embedded params get
+        // substituted too.
+        uint64 init = inline_local_lookup(wnt)
+        if init != 0 {
+            uint64 sub = inline_clone_subst(init, fn_node, args_first)
+            if sub != 0 {
+                uint32 zero = 0
+                ast_set_next(sub, zero)
+            }
+            return sub
+        }
+        // Free variable — copy as-is.
         uint64 idn = ast_alloc(32)
         uint32 nt32 = nt
         ast_set_data1(idn, nt32)
@@ -454,6 +680,38 @@ fn inline_try_call(uint64 call_node, uint64 root) -> uint64 {
 
     uint32 args_first = ast_child(call_node)
     uint64 wargs = args_first
+
+    // Rotation-shape candidates: require all args to be trivial (Ident
+    // or literal), and populate the body-locals table from the
+    // callee's VarDecl prefix so clone-subst can expand `lo` and `hi`.
+    uint64 flag = inline_flag_get(tidx)
+    inline_locals_count = 0
+    if flag != 0 {
+        uint64 walk_arg = wargs
+        while walk_arg != 0 {
+            if inline_arg_is_trivial(walk_arg) == 0 { return 0 }
+            uint32 anxt = ast_next(walk_arg)
+            walk_arg = anxt
+        }
+        // Walk the callee's body block; register VarDecls.
+        uint32 body_blk = ast_data3(fn_node)
+        uint64 wbb = body_blk
+        if wbb != 0 {
+            uint32 stmt = ast_child(body_blk)
+            uint64 wstmt = stmt
+            while wstmt != 0 {
+                if ast_kind(wstmt) == 10 {
+                    uint32 vname = ast_data2(wstmt)
+                    uint32 vinit = ast_child(wstmt)
+                    uint64 wvn = vname
+                    uint64 wvi = vinit
+                    inline_local_register(wvn, wvi)
+                }
+                uint32 nxt = ast_next(wstmt)
+                wstmt = nxt
+            }
+        }
+    }
 
     // Build the substituted expression.
     uint64 new_expr = inline_clone_subst(body_expr, fn_node, wargs)
