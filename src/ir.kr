@@ -10486,6 +10486,14 @@ fn ir_optimize() {
 // ---------------------------------------------------------------------------
 // FMA pattern recognition: FADD(FMUL(a,b), c) → FFMA(a, b, c).
 // Requires the FMUL's dest to have exactly one use (this FADD).
+//
+// IR_FFMA's emitter is f64-only (mulsd+addsd) and has no float-kind slot —
+// the opcode was originally only emitted by fma_f64() builtins. The FADD/FMUL
+// imm slot encodes fk (1=f64, 2=f32); this peephole drops the FADD/FMUL imms
+// and stores c_v in IR_FFMA's imm. Firing on f32 ops would emit mulsd/addsd
+// on f32 bit patterns → garbage output (e.g. f32 dot-product reductions
+// returning meaningless values that compound across long accumulations).
+// Gate to fk==1 (f64) on both FADD and the matched FMUL.
 // ---------------------------------------------------------------------------
 
 fn ir_opt_recognize_ffma() {
@@ -10494,6 +10502,8 @@ fn ir_opt_recognize_ffma() {
     while ii < ir_insn_count {
         uint64 op = ir_insn_opcode(ii)
         if op != 20 { ii = ii + 1; continue }     // not FADD
+        uint64 add_fk = ir_insn_imm(ii)
+        if add_fk != 1 { ii = ii + 1; continue }  // not f64 — skip
         uint64 dest = ir_insn_dest(ii)
         uint64 s1 = ir_insn_src1(ii)
         uint64 s2 = ir_insn_src2(ii)
@@ -10504,7 +10514,7 @@ fn ir_opt_recognize_ffma() {
         uint64 c_v = 0
         uint64 mul_idx = 0xFFFFFFFF
         uint64 d1 = ir_def_idx(s1)
-        if d1 != 0xFFFFFFFF && ir_insn_opcode(d1) == 22 && ir_use_count_get(s1) == 1 {
+        if d1 != 0xFFFFFFFF && ir_insn_opcode(d1) == 22 && ir_insn_imm(d1) == 1 && ir_use_count_get(s1) == 1 {
             a_v = ir_insn_src1(d1)
             b_v = ir_insn_src2(d1)
             c_v = s2
@@ -10512,7 +10522,7 @@ fn ir_opt_recognize_ffma() {
         } else {
             // Try src2's def as FMUL (commutative).
             uint64 d2 = ir_def_idx(s2)
-            if d2 != 0xFFFFFFFF && ir_insn_opcode(d2) == 22 && ir_use_count_get(s2) == 1 {
+            if d2 != 0xFFFFFFFF && ir_insn_opcode(d2) == 22 && ir_insn_imm(d2) == 1 && ir_use_count_get(s2) == 1 {
                 a_v = ir_insn_src1(d2)
                 b_v = ir_insn_src2(d2)
                 c_v = s1
